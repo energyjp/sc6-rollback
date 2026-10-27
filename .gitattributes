@@ -1,0 +1,2 @@
+# Keep every file byte-exact (the sources mix CRLF and LF), so a checkout builds the same binary on any machine.
+* -text
