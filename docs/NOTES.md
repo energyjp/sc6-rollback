@@ -14,6 +14,7 @@ differently, with or without rollback, though I haven't caught that in the act y
 - "the step" = the per-frame battle update, Fotten's `LuxBattle_PerFrameTick` (`0x1402DBC60`).
 
 Part 1 is the bug and stands alone. Part 2 is a short status. Part 3 is older notes, re-checked; it's long, so treat it as an appendix.
+[DESIGN.md](DESIGN.md) explains how the plugin works as a whole, including SC6's own online netcode.
 
 # Part 1. Two direction checks read one argument too many
 
@@ -274,7 +275,7 @@ in 1.5), plus the fill hook, is how I checked the bug in Part 1.
   reach them, and on `+0x120` the confirmed pass sets the value again. What UE draws from them isn't decoded (hypothesis: the red Critical
   Edge / Reversal Edge glows).
 - This may overlap with the "presentation object lifetime and thread affinity" item in Fotten's rollback notes. The by-value
-  payloads might help a confirmed-commit step; happy to share which listener calls free memory or re-enter the core, by slot.
+  payloads might help a confirmed-commit step; [DESIGN.md](DESIGN.md) section 6 lists the listener rules and the slots that re-enter the core.
 
 ## 3.7 A trap if you checksum hitbox data (cause verified statically)
 
@@ -310,6 +311,7 @@ in 1.5), plus the fill hook, is how I checked the bug in Part 1.
 - To check that both players run the same gameplay content without listing mods, compare the move-record multimap at `PLAYER+0x455d0` (size
   at `+0x455d8`) and its keys. A content mod changed Ivy's tree from 1421 to 556 entries between launches; cosmetic mods didn't.
 
-Happy to compare notes or go deeper on any of this, especially Part 1: open an issue on this repository.
+Everything I'm publishing is in this repository: the source, these notes and [DESIGN.md](DESIGN.md), which explains how the plugin works.
+Take whatever is useful.
 
 — energy.jp

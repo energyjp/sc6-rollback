@@ -111,7 +111,8 @@ writes the exe on disk.
   muted in predicted frames and delivered from the confirmed frame, some are delivered late, and Unreal's writes back into battle state are
   undone.
 
-[docs/NOTES.md](docs/NOTES.md) has more on the game internals this needed.
+[docs/DESIGN.md](docs/DESIGN.md) explains all of this in detail, including how SC6's own online netcode works, and
+[docs/NOTES.md](docs/NOTES.md) has the individual game findings.
 
 ## Building
 
@@ -135,6 +136,7 @@ third_party/minhook/ MinHook 1.3.4 (BSD 2-Clause)
 tools/argc_static.py static check of the stock-game bug and the fix's four sites
 tools/asi_hash.py    sha256 of a build, with the PE timestamp zeroed
 sc6rb.ini            the shipped settings
+docs/DESIGN.md       how the plugin works, and how SC6's own online netcode works
 docs/NOTES.md        reverse-engineering notes
 build.sh             the build
 ```
