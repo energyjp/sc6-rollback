@@ -55,6 +55,8 @@ static int g_nonp_lines, g_lpd_lines, g_ptr_lines, g_pkf_lines, g_fo_lines;
 static int g_pkd_lines[LB_MAX];      /* fix: PRESKEEPD per-block budget (lipsync=1) */
 static int g_fail, g_trip;           /* LIPSYNCGUARD failed this battle / not yet taken by rb.c */
 static int g_armed = -1;             /* the site of the hooked restore whose first following pass is checked (-1 none) */
+static uint64_t g_guard_early, g_keep_armed; static int g_keep_armed_lines;   /* v0.36.0 (rule C): checks made by pres_flush before late calls; kept calls while a guard
+                                                                               * was armed (the tripwire: 0 by construction outside the control LSRVX) */
 static uint64_t g_lpd[2][2]; static int g_lpd_seen[2][2];   /* [player][0: +0x95ec0, 1: +0x95f50] */
 static uint64_t g_pchk[2][2];        /* [player][0: +0x95ed8, 1: +0x2b270]: the last value checked */
 
@@ -79,7 +81,7 @@ static EvFld g_ev_last[2]; static int g_ev_last_slot[2]; static char g_ev_last_k
 
 /* harness-only controls (C1B-R2-SPEC.md §4.1, C1B-R3-SPEC.md §4.1; the plugin build never reads them: g_cfg fields stay 0 / empty there) */
 static int g_h_no_after, g_h_skip = -1;
-static const char *const k_site[LIPS_SITE_N] = { "rollback", "rpb", "rpb_scratch", "fp", "core", "pk", "pkd", "evseg", "pkd_v024" };
+static const char *const k_site[LIPS_SITE_N] = { "rollback", "rpb", "rpb_scratch", "fp", "core", "pk", "pkd", "evseg", "pkd_v024", "flush" };   /* v0.36.0: + flush */
 
 int lipsync_on(void) { return g_on; }
 
@@ -158,11 +160,11 @@ void lipsync_set_active(int on) {
 
 static void stat_line(const char *why) {
     LOG("LIPSYNCSTAT b=%llu why=%s kept_calls=%llu kept_bytes=%llu restores_covered=%llu guard_checks=%llu nonp=%llu lpd_changed=%llu ptr_bad=%llu resim_p_reverted=%llu "
-        "pk_freed=%llu free_over=%llu pkd_bydesign=%llu ev_lines=%d ev_dropped=%llu ev_same=%llu\n",
+        "pk_freed=%llu free_over=%llu pkd_bydesign=%llu ev_lines=%d ev_dropped=%llu ev_same=%llu guard_early=%llu keep_armed=%llu\n",   /* v0.36.0: + guard_early, keep_armed (appended) */
         (unsigned long long)g_bat, why, (unsigned long long)g_kept_calls, (unsigned long long)g_kept_bytes, (unsigned long long)g_restores,
         (unsigned long long)g_guard_checks, (unsigned long long)g_nonp, (unsigned long long)g_lpd_changed, (unsigned long long)g_ptr_bad, (unsigned long long)g_resim_rev,
         (unsigned long long)g_pk_freed, (unsigned long long)g_free_over, (unsigned long long)g_pkd_bydesign, g_ev_lines_b, (unsigned long long)g_ev_dropped,
-        (unsigned long long)g_ev_same);
+        (unsigned long long)g_ev_same, (unsigned long long)g_guard_early, (unsigned long long)g_keep_armed);
     log_flush();
 }
 void lipsync_battle_begin(uint64_t b) {
@@ -172,6 +174,7 @@ void lipsync_battle_begin(uint64_t b) {
     g_bat = b; g_stat_pending = 1;
     g_kept_calls = g_kept_bytes = g_restores = g_guard_checks = g_nonp = g_lpd_changed = g_ptr_bad = g_resim_rev = 0;
     g_pk_freed = g_free_over = g_pkd_bydesign = 0;
+    g_guard_early = g_keep_armed = 0; g_keep_armed_lines = 0;   /* v0.36.0 */
     g_nonp_lines = g_lpd_lines = g_ptr_lines = g_pkf_lines = g_fo_lines = 0;
     memset(g_pkd_lines, 0, sizeof g_pkd_lines);
     g_fail = 0; g_trip = 0; g_armed = -1; g_kb_valid = 0; g_nfl = 0; g_fl_armed = 0;
@@ -357,27 +360,41 @@ static void watchdog(uint32_t k) {
         }
     }
 }
+/* v0.36.0 (DESIGN.md §3.4): the guard check of the last hooked restore, factored out of lipsync_pass_start (the body is unchanged): KEEP is compared with
+ * the copy taken before that restore; the first difference is LIPSYNCGUARD FAIL (g_fail / g_trip); the guard is disarmed either way */
+static void guard_check(uint32_t k, uint32_t s) {
+    if (g_armed < 0) return;
+    int site = g_armed; g_armed = -1;
+    g_guard_checks++;
+    for (int i = 0; i < g_nseg; i++) {   /* the written-back bytes (KEEP; the core-written spans of the old harness tables roll back by design) */
+        const uint8_t *m = (const uint8_t *)g_seg[i].addr, *r = g_rest + g_seg[i].roff;
+        if (!memcmp(m, r, g_seg[i].len)) continue;
+        uint32_t j = 0; while (j < g_seg[i].len && m[j] == r[j]) j++;
+        const LBlk *b = &g_b[g_seg[i].blk];
+        if (!g_fail) {
+            g_fail = 1; g_trip = 1; g_title_dirty = 1;
+            LOG("LIPSYNCGUARD FAIL site=%s s=%u f=%u p=%d blk=%s off=+0x%x (KEEP differs from the copy taken before this restore: a restore site wrote old KEEP; the rollback stops)\n",
+                k_site[site], s, k, b->p, b->name, (unsigned)(b->lo + (g_seg[i].addr - b->addr) + j));
+            log_flush();
+        }
+        break;
+    }
+}
 void lipsync_pass_start(uint32_t k, uint32_t s) {
     if (!g_on) return;
-    if (g_armed >= 0) {
-        int site = g_armed; g_armed = -1;
-        g_guard_checks++;
-        for (int i = 0; i < g_nseg; i++) {   /* the written-back bytes (KEEP; the core-written spans of the old harness tables roll back by design) */
-            const uint8_t *m = (const uint8_t *)g_seg[i].addr, *r = g_rest + g_seg[i].roff;
-            if (!memcmp(m, r, g_seg[i].len)) continue;
-            uint32_t j = 0; while (j < g_seg[i].len && m[j] == r[j]) j++;
-            const LBlk *b = &g_b[g_seg[i].blk];
-            if (!g_fail) {
-                g_fail = 1; g_trip = 1; g_title_dirty = 1;
-                LOG("LIPSYNCGUARD FAIL site=%s s=%u f=%u p=%d blk=%s off=+0x%x (KEEP differs from the copy taken before this restore: a restore site wrote old KEEP; the rollback stops)\n",
-                    k_site[site], s, k, b->p, b->name, (unsigned)(b->lo + (g_seg[i].addr - b->addr) + j));
-                log_flush();
-            }
-            break;
-        }
-    }
+    guard_check(k, s);
     watchdog(k);
     ev_frame(k);   /* v0.25 LIPSYNCEV: segments and frame windows (new frames only) */
+}
+/* v0.36.0 (DESIGN.md §3.4, rule C): rb.c pres_flush, before late calls reach UE: the check of the last hooked restore runs now, so a late call that writes
+ * KEEP (+0x038) is never mistaken for a restore that wrote old KEEP. Nothing writes KEEP between this point and the next pass start but those late calls
+ * (rb.c confirm_upto -> pres_flush, then the live pass), so the check covers exactly what the pass-start check covered. Harness control
+ * h_lips_skip_site=flush (LSRVX): v0.35.0's order (the check stays at the next pass start) */
+void lipsync_guard_before_late(uint32_t s) {
+    if (!g_on) return;
+    if (g_h_skip == LIPS_SITE_FLUSH) return;
+    if (g_armed >= 0) g_guard_early++;
+    guard_check(s, s);
 }
 int lipsync_guard_tripped(void) {
     if (!g_on) return 0;
@@ -487,6 +504,10 @@ void lipsync_l4_keep_end(void) {
         o += n;
     }
     if (kept) { g_kept_calls++; g_kept_bytes += kept; }
+    if (kept && g_armed >= 0 && rb_is_on()) {   /* v0.36.0 (rule C) tripwire: a kept call while a restore's guard is pending (its check would read the kept bytes as old KEEP) */
+        g_keep_armed++;
+        if (!g_keep_armed_lines++) LOG("LIPSYNC keep_while_armed slot=+0x%03x site=%s (a kept call while a restore's guard is pending)\n", g_kb_slot * 8, k_site[g_armed]);
+    }
     for (int c = 0; c < 2; c++) if (pk[c]) ev_event("keep", core_frame(), c, g_kb_slot, rb_lips_pass_name());   /* v0.25 LIPSYNCEV: one line per kept call and player */
 }
 

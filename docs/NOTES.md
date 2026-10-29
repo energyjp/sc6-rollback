@@ -14,6 +14,7 @@ differently, with or without rollback, though I haven't caught that in the act y
 - "the step" = the per-frame battle update, Fotten's `LuxBattle_PerFrameTick` (`0x1402DBC60`).
 
 Part 1 is the bug and stands alone. Part 2 is a short status. Part 3 is older notes, re-checked; it's long, so treat it as an appendix.
+Part 4 is newer: the Reversal Edge's spark, sound and voice line under rollback, and how UE tracks sounds.
 [DESIGN.md](DESIGN.md) explains how the plugin works as a whole, including SC6's own online netcode.
 
 # Part 1. Two direction checks read one argument too many
@@ -190,9 +191,12 @@ every frame of the fight (the controller block differs on frames 1-843, before t
   fixed 2 frames; a time sync that slows whichever PC runs ahead; the input delay is set per battle from the measured ping (2, 3 or 4
   frames) with up to 7 frames of rollback on top; an on-screen status indicator; and effect calls a rollback hid on two listener slots are
   re-sent from the confirmed pass (Part 3, 3.6).
+- **Since 0.34.1 (in 0.36.1, tested on one PC and in three two-PC battles, on in the shipped `sc6rb.ini`):** the Reversal Edge's
+  spark, startup sound and voice line come back about 100 ms late instead of never, and missed sound stops are re-sent with UE's
+  newest-copy-only sound tracking in mind (Part 4).
 - **Still open:** other listener slots still miss calls during rollbacks, and any slot can still get a call from a misprediction. At about
-  330 ms the other player saw a Reversal Edge startup spark stay on a weapon for a whole round (I think it's one of those slots, hypothesis); the
-  game still waits on the other PC on about 1 frame in 10 at that ping; audio stutters there.
+  330 ms the other player saw a Reversal Edge startup spark stay on a weapon for a whole round (I think it's a missed `+0x010` stop,
+  hypothesis, 4.7); the game still waits on the other PC on about 1 frame in 10 at that ping; audio stutters there.
 
 # Part 3. Older notes (re-checked)
 
@@ -310,6 +314,149 @@ in 1.5), plus the fill hook, is how I checked the bug in Part 1.
   of the old predictor gives about 8,935, so roughly 90% fewer (that comparison is modeled, not measured).
 - To check that both players run the same gameplay content without listing mods, compare the move-record multimap at `PLAYER+0x455d0` (size
   at `+0x455d8`) and its keys. A content mod changed Ivy's tree from 1421 to 556 entries between launches; cosmetic mods didn't.
+
+# Part 4. Effects, sounds and voice lines under rollback (new in 0.35 and 0.36)
+
+At 150 ms, on one PC, every Reversal Edge lost its white startup spark, its startup sound and its voice line. This part covers the listener
+slots behind them, what UE does with each, and how my build re-sends them. 0.35 and 0.36 were my private builds: the spark and the sound
+are re-sent since 0.35, the late sound stops and the voice line since 0.36. The public release with all of it is 0.36.1. Its shipped
+`sc6rb.ini` turns it on (`rb_pres_slots`, DESIGN.md section 6); without that key the plugin keeps 0.34.1's set.
+
+## 4.1 Why they vanish (verified)
+
+- **The test:** a recording of me as Nightmare doing 21 Reversal Edges (taps and holds) against an idle opponent, replayed on one PC at 0
+  and 150 ms with every listener call logged. For each frame the log has the calls of the confirmed pass and the calls UE actually got.
+- **What happens:** at 150 ms the move's first frames are first simulated with a predicted input that has no B+G yet, so that live pass
+  makes none of the Reversal Edge's calls. The rollback about 6 frames later makes them in a re-simulation, which forwards nothing to UE
+  (DESIGN.md section 6), and by the next live pass that frame is in the past. They're missed starts, 21 of 21:
+  - two `+0x008` calls on the move's first frame: the spark, effect ids `0x080f` and `0x0810`;
+  - two `+0x028` calls on the same frame: the startup sounds, ids `0x49` and `0x77`;
+  - one `+0x038` four frames later: the voice line (Nightmare's shout, voice id `0x14`).
+- Calls from about 9 frames into the move on reached UE as usual. At 0 ms everything showed. Both runs matched the recording on every
+  gameplay field, on every frame (apart from the pre-fight controller block, as in 1.5).
+- So it isn't a stuck effect from a wrong guess. It's a start that only the confirmed timeline made, and no live pass ever sent it.
+
+## 4.2 The spark: listener `+0x008` / `+0x010` (verified unless marked)
+
+- **What UE reads:** `+0x008` (`0x140400540`) reads rcx and rdx only, never r8, r9 or the stack. `0x1403eb230` converts 0x41 bytes of the
+  payload ([0,0xc), [0x10,0x1c), [0x20,0x2c), [0x30,0x41)) into a 0x50-byte local, which goes out on the native delegate at listener+8
+  (`0x141d38300`).
+  - +0x00 kind; +0x04 effect id; +0x08 side+1;
+  - +0x10 position; +0x20 rotation; +0x30 scale;
+  - +0x34 owner index (-1 = not attached); +0x38 attach parameter; +0x3c..+0x40 flags.
+  - A late copy needs all 0x41 bytes. My first late-call buffer held 0x30, which would have handed UE the next entry's bytes as the scale,
+    owner and flags.
+- **Persistent effects:** handler `0x1404708a0` keeps per-owner, per-slot stacks keyed by effect id (the owner from +0x34). Only `+0x010`
+  {id, owner+1} removes an entry (`0x1404704f0`), or {-1, owner+1}, the owner's stop-all (`0x1404507b0`). A stop is idempotent, and a stop
+  with no match does nothing.
+- **The Reversal Edge:** `0x080f` is stopped 30 frames in (tap) or 50 (hold). `0x0810` is never stopped (hypothesis: a one-shot). For both,
+  +0x08 = 1 and +0x34 = 0, so a key built from +0x08 and the stop's owner+1 agree.
+- Two other handlers keep on / off toggles by category (`0x93f` on, `0x947` off). My late re-send doesn't treat those as start / stop
+  pairs yet.
+- UE re-enters the core during some `+0x008` calls (a bone lookup through IBattleCore `+0x0e0`). A late call needs the same guard as a live
+  one (3.6).
+
+## 4.3 Sounds: listener `+0x028` / `+0x030`, and UE keeps only the newest copy (verified unless marked)
+
+- **Play:** `+0x028` (`0x140400880`) reads owner u32 +0, sound id u32 +4, position +0x10..+0x1b and material u32 +0x20; no r8 or r9. At every
+  core site the owner is 2 if `[player+0x23c] == 1`, else 1.
+- **Stop:** `+0x030` (`0x140400920`) reads {owner, id}. Id -1 stops every sound of the owner on the Blueprint side (hypothesis); the native
+  lookup of -1 finds nothing, because plays reject negative ids (`0x1403c644f`).
+- **The trap.** UE's sound handler (`0x1403c63c0`) keeps one map per owner, sound id -> playback. Every play removes the id's entry
+  (`0x1403c6b1f`) and adds the new playback (`0x1403c6b4e`), **without stopping the old playback**: the old one keeps playing, untracked. A stop
+  (`0x1403c7720`) stops only the playback in the map (`0x140525460` -> `0x140560d50`). Once a newer copy has started, the older one can't be
+  stopped again.
+- **Why it matters for rollback:** re-sending a missed sound late is harmless for a one-shot, but a looped sound can end up playing for
+  good, in two ways:
+  - UE missed a looped sound's stop, and the sound is re-sent late. The late copy takes over the map, the next stop ends the late copy, and
+    the first copy plays on.
+  - A late copy's own stop is still pending when a live restart of the same sound arrives. The late copy is now untracked, and its stop can
+    never reach it.
+- **Which sounds loop:** hypothesis. I haven't checked the sound banks for loop flags. In the Nightmare recording no sound the battle plays
+  is ever stopped by id. In a Voldo vs CPU Cervantes recording, four sounds are.
+
+## 4.4 The voice line: listener `+0x038` / `+0x040` (verified unless marked)
+
+- **What UE reads:** `+0x038` (`0x140400b40`) reads 13 bytes: owner u32 +0 (0..5, anything else counts as 5), voice id u32 +4, sub-id u32 +8,
+  and a no-lip-sync byte at +0xc; no r8 or r9.
+- **The handler** (`0x1403c6b80`, hypothesis, strong) starts lip-sync through IBattleCore `+0x0e0` and `0x1402d3880` -> `0x1402f77c0` on the
+  player's voice lip channel (`PLAYER+0x95ec0`). It then queues the audio on a per-owner voice player with a new playback id.
+- **Newer replaces older:** there's one lip channel per player, so a newer voice always replaces the older one's lip-sync. The native code
+  never stops the older line's audio (whether the sound engine's cue limits cut it is a hypothesis).
+- **The only voice stop** is `+0x040` (`0x140400bb0`), from one core site (`0x14038c072`, in the step). In the Nightmare recording it fired
+  three times, never at a hit, a throw or a KO. A `+0x040` with kind 2 (u32 +4) is a no-op in the native handler.
+- **The face follows a late voice:** the lip channel restarts at time 0 with the late call, and the core advances it every frame, so the
+  mouth moves in step with the late audio (mechanism verified; how it looks in game is a hypothesis).
+- **A trap in my own lip-sync handling.** A voice writes the lip-sync state my plugin keeps across rollbacks (the face weights, the lip data
+  pointer, the lip-sync controller). My lip-sync guard checks, on the first pass after a restore, that the restore didn't write stale kept
+  state; if it did, rollback turns off for the battle.
+  - One path in my rollback restores at a barrier and then sends late calls before the next live pass. A late voice there would trip the
+    guard and turn rollback off.
+  - None of my real logs took that path. In 0.36 the guard's check runs before any late calls go out, and a test that forces the path
+    shows the old order failing and the new one passing.
+- **How late:** a late call is at most as late as the rollback depth: 6 frames (100 ms) in my 150 ms rig.
+
+## 4.5 How 0.35 and 0.36 re-send them
+
+- **The mechanism** is the one `+0x120` / `+0x128` already use (3.6). A call the confirmed pass made that UE never got goes out once, late,
+  between frames. It runs inside the guard that undoes UE's writes to core state, and carries the confirmed r8 / r9 and a 0x48-byte copy of
+  the payload.
+- **Never twice:**
+  - the same bytes already reached UE;
+  - the same effect reached UE at another position;
+  - per frame, at most (confirmed calls minus delivered calls) of a slot go out;
+  - a near window of 3 frames, because a mispredicted pass often makes the same call a frame or two off.
+  - r8 / r9 are never part of the identity: at these call sites they're leftovers.
+- **The spark (0.35):**
+  - a late start is dropped if UE already got its stop;
+  - every late start is remembered, and a confirmed stop that UE missed and that hits one goes out late, unless UE got a newer start of
+    that effect.
+- **Sounds (0.36): a mirror of UE's map.**
+  - For each (owner, id) the plugin keeps the playback UE is tracking: live or one of mine, from which frame, and whether it may still be
+    playing. It's updated from every sound call UE gets, in the order UE gets them. Then:
+  - a missed stop goes out late if UE still tracks an older playback of that sound that may be playing;
+  - a late start is held back if UE already tracks a newer playback;
+  - before a late start that would untrack an older copy that's still playing, and isn't the confirmed timeline's own, a stop goes first;
+  - **before a live restart that would untrack one of my late copies that may still be playing, the plugin calls UE's stop itself, in the
+    middle of the live frame**, inside the same guard. It's the only way to reach the late copy before it's orphaned.
+  - a missed stop-all goes out when the owner may still have a sound playing, unless UE already got a newer sound of that owner; then
+    each of my late copies of that owner gets its own stop instead.
+- **The voice (0.36):** sent late like the spark, except it's skipped if UE already got a newer voice of that player, or a real `+0x040` of
+  that player.
+- **Gameplay can't change:** every late or extra call runs inside the guard. These calls only change what you see and hear.
+
+## 4.6 Results (verified)
+
+- **The Nightmare recording at 150 ms:** the spark and the sound on all 21 Reversal Edges (0.35). 0.36 adds the voice line on all 21, about
+  100 ms late, with nothing doubled or left playing that I could see or hear.
+  - In the logs every confirmed call of those three slots reached UE once, live or late.
+  - The gameplay hashes, the rollbacks and the confirmed calls were identical to the run without the fix.
+  - The 13 mid-frame stops landed on exactly the frames I had predicted from the earlier trace.
+- **The Voldo vs CPU Cervantes recording at 150 ms** (16,286 frames, 1,003 rollbacks): it sounded normal.
+  - 55 mid-frame stops and 13 stops before late starts, none of them failed.
+  - The gameplay hash equals the 0 ms replay's on every frame, the frame-10948 clash from Part 1 included.
+- **A model of UE's sound handler,** built from the disassembly in 4.3 and driven by random battles with looped and one-shot sounds,
+  mispredictions and rollbacks:
+  - sounds left playing because of my late calls: 24,886 with the 0.35 rule, 0 with the 0.36 rule, over 2,000 battles in each of 20 setups;
+  - with the mid-frame stop switched off it was 827, and with the stop before a late start switched off, 1,842.
+- **Online, two PCs (0.36):** three battles, at about 335, 335 and 156 ms round trip.
+  - Every cross-PC check agreed on both PCs (184, 177 and 138).
+  - Nothing doubled or stuck that either of us heard.
+  - The spark and the voice line never went missing. Late sounds: 16 to 127 per battle and PC.
+  - Mid-frame stops: 82 on one PC and 129 on the other, none failed.
+  - In one 335 ms battle, 6 missed stops of sounds that were still playing went out late: the first time that path ran in a real game.
+- **Cost:** re-sending about 180 calls in a 3-minute battle took about 40 ms in all, at most about 1 ms in one step.
+
+## 4.7 Still open
+
+- **The late stop has run in a real game only 6 times** (one 335 ms battle, 4.6). Neither 150 ms recording missed a stop of a sound that
+  was playing, so most of its proof is still the model and my test harness.
+- **Which sound cues loop** (4.3).
+- **The stuck spark at about 330 ms** (Part 2) is more likely a missed `+0x010` stop than a start from a misprediction (hypothesis). The same
+  mirror can send missed `+0x010` stops; it's built but switched off.
+- **The voice rules can be fooled on an overloaded frame:** with more than 32 presentation calls in one frame, an older voice line could
+  follow a newer one. The 156 ms battle had such frames (about 1,200 to 1,400 calls past that limit on each PC); nothing sounded wrong.
+- Other slots still miss calls (`+0x0a0`, `+0x0c8` and more, DESIGN.md section 6).
 
 Everything I'm publishing is in this repository: the source, these notes and [DESIGN.md](DESIGN.md), which explains how the plugin works.
 Take whatever is useful.

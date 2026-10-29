@@ -101,10 +101,17 @@ void rb_straight_mark(uint32_t f);       /* mode=record / replay: the live pass 
 int  rb_ss_stable(void);                 /* ss_build: build the snapshot set in the stable layout (mode=rbreplay) */
 uint32_t rb_layout_gen(void);
 /* listener hooks (modes.c lsn_pre): 1 = mute this call (skip UE, rax/xmm0 = 0). v0.33.0: + rdx (the presentation slots' payload, §22.1) */
-int  rb_lsn_pre(int slot, uint64_t rdx);
-/* v0.33.0 (OPTA-M2-SPEC.md §22.1): modes.c delivers n presentation notifications (slot index, the 0x30-byte payload copy) to UE's real listener between
- * passes, each inside L4's guard when guard = 1 (the core .bss revert, the kept listener pointer, L4DANGLE, L4REENTRY). Returns the calls made. */
-int  modes_lsn_deliver(int n, const uint8_t *slots, uint8_t (*pay)[0x30], int guard);
+int  rb_lsn_pre(int slot, uint64_t rdx, uint64_t crsp);   /* v0.34.2 review fix MINOR-8: + crsp (the forwarding thunk's caller rsp: the trace reads r8 / r9) */
+/* v0.33.0 (OPTA-M2-SPEC.md §22.1): modes.c delivers n presentation notifications to UE's real listener between passes, each inside L4's guard when
+ * guard = 1 (the core .bss revert, the kept listener pointer, L4DANGLE, L4REENTRY). Returns the calls made.
+ * v0.35.0 (OPTA-M2-SPEC.md §25): one late call = RbLate: the slot index, the confirmed call's r8 / r9 and a 0x48-byte copy of the bytes UE reads at rdx
+ * (+0x008 reads 0x41 of them, V); UE's real function is called as fn(listener, pay, r8, r9) */
+#define RB_LATE_PAY 0x48
+typedef struct { uint8_t slot, pad[7]; uint64_t r8, r9; uint8_t pay[RB_LATE_PAY]; } RbLate;
+int  modes_lsn_deliver(int n, const RbLate *q, int guard);
+/* v0.36.0 (OPTA-M2-SPEC.md §26): modes.c makes one +0x030 stop {pay8: owner, id; the rest 0; r8 = r9 = 0} inside the current forwarding pass, from rb.c's
+ * listener hook right before the core's +0x028 is forwarded (UE's function of the pass's listener, the FP guard and L4's guard around it). 1 = called */
+int  modes_lsn_inject(int slot, const uint8_t *pay8);
 /* mem.c free paths (outside the step context, rb on): 0 = not ours (normal path), 1 = quarantined (do not free), 2 = pin marked dead
  * (free now, no pins_note_free) */
 int  rb_mem_free(uintptr_t p, int crt, int deferred_hit);

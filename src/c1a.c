@@ -339,7 +339,10 @@ const char *c1a_plugin_compat2(uint64_t rec_plugin_hash) {
     if (c) return c;
     /* v0.32.0 (OPTA-M2-SPEC.md §21.7): + 0.31.0-optA-M2 (the S-M2c recording c1a_20261026_011013_b2.rec replays on v0.32.0: the C1a / rb step path, the
      * normalization and tier-1 / tier-2 are unchanged; v0.32.0's changes are rbonline's CHECK message and the D-B A lines, which a replay only adds) */
-    static const char *const k_compat_c1b[] = { "0.22.2-gateC-C1a", "0.23.0-gateC-C1b", "0.24.0-gateC-C1b2", "0.25.0-gateC-C1b3", "0.26.0-gateC-C1b4", "0.31.0-optA-M2" };   /* C2: + the C1b4 build (v0.26 recordings replay) */   /* C1B4: + the round-3 build (L2's live recording) */   /* v0.24.0-C1b2: + the session-1 build; C1B3: + the round-2 build (both live attempts) */
+    /* v0.35.0 (OPTA-M2-SPEC.md §25): + 0.34.2-optA-M2 (the S-FX recording c1a_20261027_170956_b2.rec, made by 0.34.2, replays on v0.35.0 for Session S-FX35:
+     * the step path, the normalization and tier-1 / tier-2 are unchanged; v0.35.0's changes are the late presentation calls between passes and the trace's
+     * line format, which a replay only adds) */
+    static const char *const k_compat_c1b[] = { "0.22.2-gateC-C1a", "0.23.0-gateC-C1b", "0.24.0-gateC-C1b2", "0.25.0-gateC-C1b3", "0.26.0-gateC-C1b4", "0.31.0-optA-M2", "0.34.2-optA-M2" };   /* C2: + the C1b4 build (v0.26 recordings replay) */   /* C1B4: + the round-3 build (L2's live recording) */   /* v0.24.0-C1b2: + the session-1 build; C1B3: + the round-2 build (both live attempts) */
     for (size_t i = 0; i < sizeof k_compat_c1b / sizeof k_compat_c1b[0]; i++) if (c1a_plugin_hash(k_compat_c1b[i]) == rec_plugin_hash) return k_compat_c1b[i];
     return NULL;
 }

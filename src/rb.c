@@ -70,6 +70,9 @@ static void refuse(const char *k, const char *v, const char *need) {
 static void refuse_i(const char *k, long long v, const char *need) { char b[32]; snprintf(b, sizeof b, "%lld", v); refuse(k, b, need); }
 
 static void pres_cfg(void);   /* v0.33.0 (OPTA-M2-SPEC.md §22.1): rb_pres_slots / rb_pres_repair, below */
+static void tr_cfg(void);     /* v0.34.2 (OPTA-M2-SPEC.md §24): rb_lsn_trace / rb_lsn_trace_lines, below */
+static void tr_pres(uint32_t f, int slot, const char *why, const uint8_t *pay, uint64_t r8, uint64_t r9);   /* v0.34.2 review fix MAJOR-2: pres_confirm's decisions as k=L lines,
+                                                                                                         * below; v0.35.0: + the confirmed call's r8 / r9 */
 static void refuse2(const char *k, const char *v, const char *need) {   /* C2 (C2-SPEC.md §6.1): the rbnet refusals */
     LOG("CFG C2 REFUSE key=%s value=%s need=%s\n", k, v, need);
     if (!g_refused[0]) snprintf(g_refused, sizeof g_refused, "%s", k);
@@ -207,6 +210,7 @@ int rb_cfg_check(void) {
     if (c->lipsync != 0 && c->lipsync != 1) refuse("lipsync", c->lipsync_s, "0|1");   /* LIPSYNC: refusal hook (C1B-R2-SPEC.md §3.6) */
     q1_cfg_check(c);   /* v0.29.2 (OPTA-M2-SPEC.md §16.9): the hybrid keys (no line, no refusal without them: every existing ini keeps its bytes) */
     pres_cfg();        /* v0.33.0 (OPTA-M2-SPEC.md §22.1): rb_pres_slots / rb_pres_repair (presentation: clamped, never refused) */
+    tr_cfg();          /* v0.34.2 (OPTA-M2-SPEC.md §24): rb_lsn_trace (diagnostics: clamped, never refused) */
     g_cfg_ok = !g_refused[0];
     if (!g_cfg_ok) LOG("CFG C1B REFUSED key=%s: mode=%s refused, the plugin runs mode=off (title rb=REFUSED:%s); l4=2 and every other value outside the C1B-SPEC §2.10 set are never accepted\n", g_refused, g_mode_names[c->mode], g_refused);
     lipsync_set_active(g_cfg_ok && c->lipsync == 1);   /* LIPSYNC: CFG LIPSYNC on=1 */
@@ -249,19 +253,37 @@ static DpEnt g_dp[DP_CAP]; static int g_ndp;   /* addr 0 = a tombstone (compacte
  * delivered once, late (rb.c pres_confirm -> modes_lsn_deliver, guarded by L4 like a forwarded call); a delivered call that the confirmed pass
  * does not have is an orphan (UE cannot be told to undo it; for +0x120, a value channel keyed by its first 8 bytes, the confirmed value of
  * that key is sent back when the orphan is still UE's latest value of the key: the repair). Review fix M1 (§22.9): a +0x128 call goes out late
- * only when the confirmed pass made more +0x128 calls for the frame than UE got, and never for an effect UE already showed at another position. */
-#define PRES_MAXC 16     /* calls of the presentation slots per pass (more: counted as over=, not recorded) */
-#define PRES_MAXD 32     /* delivered calls per frame */
+ * only when the confirmed pass made more +0x128 calls for the frame than UE got, and never for an effect UE already showed at another position.
+ * v0.35.0 (OPTA-M2-SPEC.md §25): + +0x008 (the effect start: the Reversal Edge spark) and +0x028 (the sound), each with the confirmed r8 / r9; +0x010
+ * (the effect stop) is watched while +0x008 is on (the stop guard, the own stop); the frame buffers grow (a round-start frame: 16 +0x120 re-sends + up to
+ * 7 +0x010 stops, V R3) and the payload copy is 0x48 bytes (+0x008: UE reads 0x41). */
+#define PRES_MAXC 32     /* calls of the presentation slots per pass (more: counted as over=, not recorded); v0.35.0: 16 -> 32 */
+#define PRES_MAXD 64     /* delivered calls per frame; v0.35.0: 32 -> 64 */
 #define PRES_HIST 10     /* passes per frame kept for the delay counterfactual */
-#define PRES_PAY 0x30
-typedef struct { uint8_t slot, fwd, pad[6]; uint64_t h, idh; uint8_t pay[PRES_PAY]; } PresCall;   /* idh: review fix M1 (pres_idh) */
-typedef struct { uint64_t h, key, idh; uint8_t slot, has_key, pad[6]; } PresDlv;
+#define PRES_PAY RB_LATE_PAY   /* v0.35.0: 0x30 -> 0x48 (the bytes beyond a slot's ranges are zero on both sides of every comparison) */
+typedef struct { uint8_t slot, fwd, regs, pad[5]; uint64_t h, idh, r8, r9; uint8_t pay[PRES_PAY]; } PresCall;   /* idh: review fix M1 (pres_idh); v0.35.0: + r8 / r9
+                                                                                                         * (the thunk's copies; regs = read) */
+typedef struct { uint64_t h, key, idh, k2; uint8_t slot, has_key, claimed, pad[5]; } PresDlv;   /* v0.35.0: + k2 (the start / stop key id | owner << 32), claimed
+                                                                                               * (credited to a confirmed call of another frame: the near window) */
 typedef struct {
     int nl, nd, nh, over;
     PresCall last[PRES_MAXC];                                  /* the frame's last pass (the confirmed one at confirmation) */
     PresDlv dlv[PRES_MAXD];                                    /* every call of the frame that reached UE (live passes; a muted resim delivers none) */
     struct { uint32_t s; int n; uint64_t h[PRES_MAXC]; } hist[PRES_HIST];   /* each pass: its step and its calls (the counterfactual) */
 } PresFrame;
+
+/* v0.34.2 (the spark test, OPTA-M2-SPEC.md §24): the listener-call trace. rb_lsn_trace=<slots> (default none) records, in every recorded pass of a
+ * frame, each call of these listener slots with its argument rdx and, when rdx points into the step thread's stack, the 0x30 bytes there (the raw
+ * payload: its layout is not known for most slots, so nothing is compared, matched or delivered). At the frame's confirmation one RBLSNTR line is
+ * written per call of the confirmed (last) pass (k=F) and per call UE got from any pass of the frame (k=D), so a missed call (an F with no
+ * matching D) and an orphan (a D with no F) can be read offline next to the recording's inputs and moves. Logging only: outside every hash, never
+ * refused, no listener call made, muted or changed. v0.35.0: the raw payload is 0x48 bytes (the +0x008 bytes +0x30..+0x40 UE reads were a blind spot). */
+#define TR_MAXC 32
+#define TR_PAY RB_LATE_PAY   /* v0.35.0: 0x30 -> 0x48 */
+_Static_assert(TR_PAY <= PRES_PAY, "tr_pres copies TR_PAY bytes from a PRES_PAY buffer");
+typedef struct { uint8_t slot, fwd, inst, regs; uint32_t s; uint64_t rdx, r8, r9; uint8_t pay[TR_PAY]; } TrCall;   /* s: the step of the pass; inst: pay read;
+                                                                                                       * regs: r8 / r9 read (review fix MINOR-8) */
+typedef struct { int nl, nd, over; TrCall last[TR_MAXC]; TrCall dlv[TR_MAXC]; } TrFrame;
 
 #define PEND_N 16
 typedef struct {
@@ -277,6 +299,8 @@ typedef struct {
                                       * reached UE (any pass); an RPB forwards only the calls whose bit is clear */
     PresFrame pres;                  /* v0.33.0 (OPTA-M2-SPEC.md §22.1) */
     uint16_t pres_late[LISTENER_NSLOTS], pres_sup[LISTENER_NSLOTS];   /* v0.33.0: delivered late / superseded at the confirmation (RBLEDGER) */
+    uint16_t pres_near[LISTENER_NSLOTS];   /* v0.35.0: credited by the near window (UE got the call 1 to 3 frames off) at the confirmation (RBLEDGER near=) */
+    TrFrame tr;                      /* v0.34.2: the listener-call trace (rb_lsn_trace) */
 } Pend;
 static Pend g_pend[PEND_N];
 
@@ -293,6 +317,7 @@ typedef struct { char c[32]; uint64_t n; } CauseN;
 static CauseN g_bc[16]; static int g_nbc;
 static uint64_t g_led_fwd[LISTENER_NSLOTS], g_led_final[LISTENER_NSLOTS], g_led_orphan[LISTENER_NSLOTS], g_led_missed[LISTENER_NSLOTS];
 static uint64_t g_led_late[LISTENER_NSLOTS], g_led_sup[LISTENER_NSLOTS];   /* v0.33.0 (§22.1): the presentation slots' late deliveries / superseded calls */
+static uint64_t g_led_near[LISTENER_NSLOTS];   /* v0.35.0 (§25): the near-window credits (+0x008 / +0x028) */
 static int g_lines_clamp, g_lines_pinq, g_lines_tick;
 static uint64_t g_c0_mid; static int g_c0_late_max;   /* C1B3: RBSTATEEV slot=+0x0c0 with z=0 (mid-fight) and their largest late */
 static double g_diag;                /* us of diagnostics in this step */
@@ -321,7 +346,8 @@ static DWORD g_step_tid;
 enum { PT_NONE = 0, PT_LIVE, PT_SEG, PT_CRESIM, PT_URESIM, PT_RPB, PT_STRAIGHT };
 static struct { int type; uint32_t k, s; uint64_t c0; int final; uint16_t calls[LISTENER_NSLOTS], fwd[LISTENER_NSLOTS], stn[LISTENER_NSLOTS]; int muted, mslot;
                 int quiet, quiet_fwd; void *pend;
-                int pn, pover; PresCall pc[PRES_MAXC]; } g_pass;   /* v0.33.0: + the pass's presentation calls */
+                int pn, pover; PresCall pc[PRES_MAXC];   /* v0.33.0: + the pass's presentation calls */
+                int tn, tover; TrCall tc[TR_MAXC]; } g_pass;   /* v0.34.2: + the pass's traced listener calls (rb_lsn_trace) */
 
 int rb_on(void) { return g_st == RB_ON; }
 int rb_ss_stable(void) { return is_rbcore_mode(g_cfg.mode) && is_rbcore_mode(g_mode); }
@@ -386,6 +412,8 @@ static Pend *pend_new(uint32_t f) {
     memset(p->calls, 0, sizeof p->calls); memset(p->fwd, 0, sizeof p->fwd); memset(p->sfwd, 0, sizeof p->sfwd);
     p->f = f; p->valid = 1; p->ps = '?'; p->pend_st = 0; p->pend_slot = 0; p->mode = 0;
     p->pres.nl = p->pres.nd = p->pres.nh = p->pres.over = 0; memset(p->pres_late, 0, sizeof p->pres_late); memset(p->pres_sup, 0, sizeof p->pres_sup);   /* v0.33.0 */
+    memset(p->pres_near, 0, sizeof p->pres_near);   /* v0.35.0 */
+    p->tr.nl = p->tr.nd = p->tr.over = 0;   /* v0.34.2 */
     if (p->pass.dump < -1 || p->pass.dump >= C1A_DUMP_SLOTS) p->pass.dump = -1;
     if (p->pass.mm < -1 || p->pass.mm > 8) p->pass.mm = -1;
     return p;
@@ -466,36 +494,115 @@ static int remote_quiet(uint32_t F, uint32_t f, const FrameIn *live) {
  *          are not read by UE (stack garbage at the call sites): never compared, never passed on (zero in the late copy).
  * Neither UE implementation re-enters the core or writes core state (V: no L4W / L4REENTRY line naming +0x120 / +0x128 in any of the 117 logs of
  * sc6rb\logs); the late delivery still runs inside L4's guard, so a write would be reverted and logged like a forwarded call's. */
-typedef struct { int slot, n, key; uint8_t off[3], len[3]; } PresSpec;
+/* v0.35.0 (OPTA-M2-SPEC.md §25): + the Reversal Edge spark and sound (V, the installed exe: the v0.35.0 analysis of these slots):
+ *   +0x008 (UE 0x140400540 -> 0x1403eb230, the effect start): u32 [rdx], +4 (the effect id), +8 (the owner), the vector +0x10..+0x1b (0x140455910), f32 +0x20,
+ *          +0x24, +0x28, f32 +0x30, u32 +0x34, +0x38, u8 +0x3c..+0x40 = [0,0xc) [0x10,0x1c) [0x20,0x2c) [0x30,0x41); +0x0c / +0x1c / +0x2c are never read
+ *   +0x010 (UE 0x140400590, the effect stop): u32 +0 (the id; 0xffffffff = every effect of the owner), +4 (the owner), +8, +0xc = [0,0x10)
+ *   +0x028 (UE 0x140400880, the sound): u32 +0, +4 (the sound id), the vector +0x10..+0x1b, u32 +0x20 = [0,8) [0x10,0x1c) [0x20,0x24)
+ * None of them (nor +0x120, +0x128, +0x030) reads r8 / r9 (V); a late call still passes the confirmed ones (RbLate). Live +0x008 / +0x028 calls re-enter
+ * IBattleCore query slots only (+0x010, +0x0e0, +0x110; V, R2 / R3 L4REPAIR); a late call runs inside L4's guard like a forwarded one.
+ * Classes: PC_VALUE (+0x120, a keyed value channel), PC_ONESHOT (+0x128: a positioned one-shot), PC_START (+0x008: an effect that a +0x010 stop ends;
+ * +0x028: a sound that a +0x030 stop ends), PC_STOPW (+0x010 / +0x030: recorded while their start slot is on, delivered late only as the own stop of a start
+ * this plugin sent late or credited near).
+ * v0.35.0 review fix M1: +0x028 was a one-shot (no stop guard, no own stop) on the evidence of one battle whose sounds are never stopped; a looped cue started
+ * late could then play on (its +0x030 stop missed live and never delivered, or already received before the late start). +0x028 is now a start like +0x008
+ * with +0x030 as its watch slot (V, the installed exe: UE 0x140400920 reads u32 +0 the owner and +4 the id = [0,8); its handler 0x1403c7720 stops
+ * the latest recorded playback of (owner, id); id 0xffffffff = every id of the owner, but the native lookup finds nothing for it (whether the Blueprint stops
+ * all is H), so a +0x030 stop-all counts for the stop guard and as an own stop, and never closes an own entry: sacl = 0). */
+/* v0.36.0 (OPTA-M2-SPEC.md §26, V by disassembly): + the voice line.
+ *   +0x038 (UE 0x140400b40, PlayVoice): u32 +0 (the owner, mapped by 0x1403e4340: 0..5 -> same, else 5), +4 (Id), +8 (SubId), u8 +0xc (NoLipSync) = [0,0xd); no r8 / r9
+ *   +0x040 (UE 0x140400bb0, StopVoice): u32 +0 (the owner), +4 (the kind, mapped by 0x1403e4130 {1:0, 2:1}, default 2; mapped 1 = the handler 0x1403c7860 returns) = [0,8)
+ * Classes: PC_VOICE (+0x038: the count gate, the stop guard against a real +0x040 of the owner, the near window, the supersede; no own entry), PC_VWATCH (+0x040:
+ * recorded while 0x038 is on, never delivered, never an own stop). */
+enum { PC_VALUE = 0, PC_ONESHOT, PC_START, PC_STOPW, PC_VOICE, PC_VWATCH };   /* v0.36.0: + PC_VOICE, PC_VWATCH (appended: the existing values are unchanged) */
+typedef struct { int slot, n, key; uint8_t off[4], len[4]; uint8_t cls, nearw, pos_off, pos_len; uint8_t kid, kow, mate, sacl; } PresSpec;   /* v0.35.0: + class, near window
+     * (nearw: windows.h defines near), position; review fix M1: + the key's id / owner offsets (a start or a stop), the mate slot (a start's watched stop slot, a
+     * stop's start slot) and sacl (a stop: 1 = its stop-all ends every effect of the owner, so it closes the owner's own entries) */
 static const PresSpec k_pres_spec[] = {
-    { 0x120 / 8, 1, 8, { 0, 0, 0 }, { 12, 0, 0 } },
-    { 0x128 / 8, 3, 0, { 0, 0x10, 0x20 }, { 4, 12, 13 } },
+    { 0x008 / 8, 4, 0, { 0x00, 0x10, 0x20, 0x30 }, { 12, 12, 12, 17 }, PC_START, 1, 0x10, 12, 4, 8, 0x010 / 8, 0 },   /* v0.35.0 (id +4, owner +8) */
+    { 0x010 / 8, 1, 0, { 0x00, 0, 0, 0 }, { 16, 0, 0, 0 }, PC_STOPW, 0, 0, 0, 0, 4, 0x008 / 8, 1 },                   /* v0.35.0: the watch slot of +0x008 (id +0, owner +4; V) */
+    { 0x028 / 8, 3, 0, { 0x00, 0x10, 0x20, 0 }, { 8, 12, 4, 0 }, PC_START, 1, 0x10, 12, 4, 0, 0x030 / 8, 0 },         /* review fix M1: a start (owner +0, id +4) */
+    { 0x030 / 8, 1, 0, { 0x00, 0, 0, 0 }, { 8, 0, 0, 0 }, PC_STOPW, 0, 0, 0, 4, 0, 0x028 / 8, 0 },                     /* review fix M1: the watch slot of +0x028 */
+    { 0x038 / 8, 1, 0, { 0, 0, 0, 0 }, { 13, 0, 0, 0 }, PC_VOICE, 1, 0, 0, 4, 0, 0x040 / 8, 0 },                       /* v0.36.0: owner +0, Id +4 (key); [0,0xd) = identity */
+    { 0x040 / 8, 1, 0, { 0, 0, 0, 0 }, { 8, 0, 0, 0 }, PC_VWATCH, 0, 0, 0, 4, 0, 0x038 / 8, 0 },                       /* v0.36.0: owner +0, kind +4; watched, never delivered */
+    { 0x120 / 8, 1, 8, { 0, 0, 0, 0 }, { 12, 0, 0, 0 }, PC_VALUE, 0, 0, 0, 0, 0, 0, 0 },
+    { 0x128 / 8, 3, 0, { 0, 0x10, 0x20, 0 }, { 4, 12, 13, 0 }, PC_ONESHOT, 0, 0x10, 12, 0, 0, 0, 0 },                 /* no near window: v0.33.0's §22.9 rule */
 };
-#define PRES_VERIFIED_MASK ((1ULL << (0x120 / 8)) | (1ULL << (0x128 / 8)))
+#define PRES_VERIFIED_MASK ((1ULL << (0x008 / 8)) | (1ULL << (0x028 / 8)) | (1ULL << (0x038 / 8)) | (1ULL << (0x120 / 8)) | (1ULL << (0x128 / 8)))   /* v0.35.0: + 0x008, 0x028;
+                                                                                                                                                * v0.36.0: + 0x038 */
+#define PRES_WATCH_SLOT (0x010 / 8)   /* v0.35.0: recorded while 0x008 is on (the stop guard, the own stop); never accepted from the ini (review fix M1: + 0x030 while 0x028 is on;
+                                       * v0.36.0: + 0x040 while 0x038 is on) */
+#define PRES_NEAR_W 3                 /* v0.35.0: the near window of +0x008 / +0x028 (frames) */
+/* v0.35.0: the shipped default stays v0.33.0's (no default change without a decision). The design proposed "0x008,0x028,0x120,0x128";
+ * flipping it is this one string. Every shipped ini names the key, so they are unaffected either way. */
+#define PRES_DEFAULT_SLOTS "0x120,0x128"
 static uint64_t g_pres_mask;        /* rb_pres_slots (default +0x120,+0x128; "none" = v0.32.0: nothing recorded, nothing delivered late) */
+static uint64_t g_pres_watch;       /* v0.35.0: 1 << PRES_WATCH_SLOT when 0x008 is on; review fix M1: + 1 << (0x030 / 8) when 0x028 is on */
 static int g_pres_repair = 1;       /* rb_pres_repair: the +0x120 orphan repair */
 #ifdef SC6RB_HARNESS
 static int g_pres_nol4;             /* harness-only control (h_rb_pres_nol4=1, XFXW): the late call without L4's guard (RBT: the constant 0 in the plugin) */
 static int g_pres_128old;           /* review fix M1, harness-only control (h_rb_pres_128old=1, XFX128 / XGFX128): v0.33.0's first +0x128 rule (every
                                      * confirmed call without a byte-identical delivered partner went out late: a moved effect was shown twice) */
 static int g_pres_128noid;          /* review fix M1, harness-only control (h_rb_pres_128noid=1, XFX128ID): the count gate without the identity pairing */
+/* v0.35.0 harness-only controls (OPTA-M2-SPEC.md §25; test/harness_c1b.inc XGSX*): one rule off each */
+static int g_pres_noregs;           /* h_rb_pres_noregs=1 (XGSXR): the late call gets r8 = r9 = 0 */
+static int g_pres_pay30;            /* h_rb_pres_pay30=1 (XGSXP): bytes 0x30..0x47 of the late copy zeroed (v0.33.0's 0x30 buffer) */
+static int g_pres_nonear;           /* h_rb_pres_nonear=1 (XGSXN): no near window */
+static int g_pres_regid;            /* h_rb_pres_regid=1 (XGSXI): r8 / r9 folded into a call's content and identity */
+static int g_pres_nostopg;          /* h_rb_pres_nostopg=1 (XGSXS): no stop guard */
+static int g_pres_noown;            /* h_rb_pres_noown=1 (XGSXO): no own stop */
+static int g_pres_snd1shot;         /* review fix M1, h_rb_pres_snd1shot=1 (XGSL1): the pre-fix rule: +0x028 a one-shot (no stop guard, no own entry), +0x030 not watched */
+/* v0.36.0 harness-only controls (OPTA-M2-SPEC.md §26; DESIGN.md §4): each turns one rule off ("off" controls only: RBT is the constant 0 in the plugin, so the
+ * plugin always runs every rule), except h_rb_pres_fxlive, which turns ON the +0x010 switch the plugin cannot reach */
+static int g_pres_mir_off;          /* h_rb_pres_mir_off=1 (XGSMO): no sound mirror (v0.35.0's +0x028 rule, own entries in table [1]) */
+static int g_pres_noinj;            /* h_rb_pres_noinj=1 (XGSMI): no injected stop (a live start untracks an own late playback: untrk=) */
+static int g_pres_nosync;           /* h_rb_pres_nosync=1 (XGSMY): no sync stop before a late start */
+static int g_pres_nonewer;          /* h_rb_pres_nonewer=1: the newer test off (a late start / own stop of a key UE tracks a newer playback of) */
+static int g_pres_nostoplive;       /* h_rb_pres_nostoplive=1: missed stops of live-started sounds are not delivered (v0.35.0's own-only stops) */
+static int g_pres_noexpand;         /* h_rb_pres_noexpand=1: a held missed stop-all is not expanded into id stops of the own late playbacks */
+static int g_pres_noforce;          /* h_rb_pres_noforce=1: the timeline's untrackings do not force a missed stop-all out */
+static int g_pres_fxlive;           /* h_rb_pres_fxlive=1: the +0x010 switch ON (missed +0x010 stops of live-started effects late); OFF in the plugin (not chosen for release) */
+static int g_pres_nosupv;           /* h_rb_pres_nosupv=1 (XGSVS): no voice supersede (an older voice after a newer one) */
 #endif
 static const PresSpec *pres_spec(int slot) { for (size_t i = 0; i < sizeof k_pres_spec / sizeof k_pres_spec[0]; i++) if (k_pres_spec[i].slot == slot) return &k_pres_spec[i]; return NULL; }
-static uint64_t pres_hash(int slot, const uint8_t *pay) {
+/* review fix M1: a slot's class (the harness control h_rb_pres_snd1shot turns +0x028 back into the pre-fix one-shot) */
+static int pres_cls(const PresSpec *sp) { return RBT(g_pres_snd1shot) && sp->slot == 0x028 / 8 ? PC_ONESHOT : sp->cls; }
+static int pres_is_watch(int slot) { const PresSpec *sp = pres_spec(slot); return sp && (sp->cls == PC_STOPW || sp->cls == PC_VWATCH); }   /* +0x010 / +0x030 (v0.36.0: + +0x040):
+                                                                                                                                       * no delivery slot */
+/* v0.35.0: r8 / r9 are never part of a call's content or identity (V: r8 differs between passes for some +0x008 calls); the harness control
+ * h_rb_pres_regid folds them in */
+static uint64_t pres_hash(int slot, const uint8_t *pay, uint64_t r8, uint64_t r9) {
     uint64_t h = 0xcbf29ce484222325ULL;
     h = (h ^ (uint8_t)slot) * 0x100000001b3ULL;
     for (int i = 0; i < PRES_PAY; i++) h = (h ^ pay[i]) * 0x100000001b3ULL;
+    if (RBT(g_pres_regid)) for (int i = 0; i < 16; i++) h = (h ^ (uint8_t)((i < 8 ? r8 : r9) >> (8 * (i & 7)))) * 0x100000001b3ULL;
+    else { (void)r8; (void)r9; }
     return h;
 }
 static uint64_t pres_key(const PresCall *c) { uint64_t k; memcpy(&k, c->pay, 8); return k; }
 /* v0.33.0 review fix M1 (OPTA-M2-SPEC.md §22.9): a +0x128 call's identity = the bytes UE reads WITHOUT the position (rdx+0x10..+0x1b): the player
  * dword, +0x20 / +0x24 (r8d / r9d at 0x1403418ea; 0 / 3 at 0x140346735), +0x28 (0x1403417b0 of the flag word) and the flag byte +0x2c. The same
- * effect a little off after a misprediction keeps its identity. +0x120 (a keyed value channel): the full hash. */
-static uint64_t pres_idh(int slot, const uint8_t *pay) {
-    if (slot != 0x128 / 8) return pres_hash(slot, pay);
-    uint8_t m[PRES_PAY]; memcpy(m, pay, PRES_PAY); memset(m + 0x10, 0, 12);
-    return pres_hash(slot, m);
+ * effect a little off after a misprediction keeps its identity. +0x120 (a keyed value channel): the full hash. v0.35.0: the spec's position (+0x008 and
+ * +0x028: their vector at +0x10; +0x010: none) */
+static uint64_t pres_idh(const PresSpec *sp, const uint8_t *pay, uint64_t r8, uint64_t r9) {
+    if (!sp->pos_len) return pres_hash(sp->slot, pay, r8, r9);
+    uint8_t m[PRES_PAY]; memcpy(m, pay, PRES_PAY); memset(m + sp->pos_off, 0, sp->pos_len);
+    return pres_hash(sp->slot, m, r8, r9);
 }
+/* v0.35.0: the key of a start (+0x008: id = u32 +4, owner = u32 +8) or a stop (+0x010: id = u32 +0, 0xffffffff = every id of the owner; owner = u32 +4);
+ * review fix M1: + the sound (+0x028) and its stop (+0x030): owner = u32 +0, id = u32 +4 (the spec's kid / kow); v0.36.0: + the voice (+0x038: owner +0, Id +4)
+ * and its stop (+0x040: owner +0, kind +4) */
+static uint64_t pres_k2(const PresSpec *sp, const uint8_t *pay) {
+    uint32_t id, ow;
+    if (sp->cls != PC_START && sp->cls != PC_STOPW && sp->cls != PC_VOICE && sp->cls != PC_VWATCH) return 0;
+    memcpy(&id, pay + sp->kid, 4); memcpy(&ow, pay + sp->kow, 4);
+    return (uint64_t)id | (uint64_t)ow << 32;
+}
+static int pres_hit(uint64_t k10, uint64_t k8) { return (uint32_t)(k10 >> 32) == (uint32_t)(k8 >> 32) && ((uint32_t)k10 == 0xffffffffu || (uint32_t)k10 == (uint32_t)k8); }   /* a stop hits a start */
+/* v0.36.0: a +0x040 (k2 = kind | owner << 32) stops a +0x038 (k2 = Id | owner << 32) of the same mapped owner (0x1403e4340: 0..5 -> same, else 5), unless its
+ * payload kind is 2 (mapped to 1: the handler returns at 0x1403c78ec, no stop); kind 1 and anything else (default 2) are real stops (V) */
+static uint32_t vown(uint32_t o) { return o <= 5 ? o : 5; }
+static int vstop_hit(uint64_t k40, uint64_t k38) { return vown((uint32_t)(k40 >> 32)) == vown((uint32_t)(k38 >> 32)) && (uint32_t)k40 != 2; }
 static const char *pres_rule128(void) { return RBT(g_pres_128old) ? "content(harness control)" : RBT(g_pres_128noid) ? "count(harness control)" : "count+id"; }
 /* per battle (step thread only) */
 static uint64_t g_pres_late, g_pres_sup, g_pres_rep, g_pres_unrep, g_pres_orph, g_pres_tail, g_pres_over, g_pres_badptr, g_pres_fail, g_pres_calls, g_pres_batches;
@@ -503,9 +610,15 @@ static uint64_t g_pres_l128, g_pres_moved, g_pres_held, g_pres_dbl, g_pres_cm;  
                                                                                   * content-mismatch frames (RBPRES128) */
 static uint64_t g_pres_cf[9], g_pres_lat_sum, g_pres_lat_hist[16]; static uint32_t g_pres_lat_max;
 static double g_pres_us, g_pres_us_max;
+/* v0.35.0 (RBPRES2): per slot (+0x008, +0x028; noregs for every recorded slot) and the own stops; review fix M1: the own-stop counters per START slot (+0x008
+ * for the +0x010 stops, +0x028 for the +0x030 stops) */
+enum { P2_LATE = 0, P2_MOVED, P2_HELD, P2_NEAR, P2_STOPPED, P2_CM, P2_DBL, P2_NOREGS, P2_OWNSTOP, P2_OWNHELD, P2_NOTOWN, P2_OWNOVER,
+       P2_NEWER, P2_SYNC, P2_STOPLIVE, P2_MIROUT, P2_EXPAND, P2_FORCE, P2_SUP, P2_N };   /* v0.36.0: + the sound mirror's decisions (+0x028: newer / sync / stoplive /
+                                                                                         * unmir / expand / sallforce) and the voice's supersede (+0x038) */
+static uint64_t g_pres2[LISTENER_NSLOTS][P2_N];
 /* the value channel (+0x120): UE's latest value per key (from which frame's pass, and the payload) and the confirmed timeline's latest value per key */
 #define PRES_KEYS 64
-typedef struct { uint64_t key; uint32_t f; int valid; uint8_t pay[PRES_PAY]; } PresKey;
+typedef struct { uint64_t key; uint32_t f; int valid; uint64_t r8, r9; uint8_t pay[PRES_PAY]; } PresKey;   /* v0.35.0: + r8 / r9 (a repair passes the stored call's) */
 static PresKey g_pres_ue[PRES_KEYS], g_pres_conf[PRES_KEYS];
 static PresKey *pres_key_get(PresKey *t, uint64_t key, int make) {
     for (int i = 0; i < PRES_KEYS; i++) if (t[i].valid && t[i].key == key) return &t[i];
@@ -514,54 +627,252 @@ static PresKey *pres_key_get(PresKey *t, uint64_t key, int make) {
     memset(&t[o], 0, sizeof t[o]); t[o].key = key; t[o].valid = 1;
     return &t[o];
 }
-/* the late deliveries of one confirm_upto (flushed together: one batch per step) */
+/* v0.35.0: the own entries: every start this plugin sent late (or credited by the near window) until UE gets a stop of its key; a confirmed stop UE missed
+ * that hits one is delivered late (the own stop). 128 entries; full: the oldest by frame is evicted (own_over). Review fix M1: one table per start slot
+ * ([0] +0x008, closed by +0x010; [1] +0x028, closed by +0x030), so the sounds never evict a spark's entry and +0x008's decisions are unchanged */
+#define PRES_OWN_N 128
+static struct { uint64_t k2; uint32_t f; uint8_t open; } g_pres_own[2][PRES_OWN_N];
+static int own_tab(int start_slot) { return start_slot == 0x028 / 8; }
+static void own_open(int S, uint64_t k2, uint32_t f) {
+    int t = own_tab(S), o = -1;
+    for (int i = 0; i < PRES_OWN_N && o < 0; i++) if (!g_pres_own[t][i].open) o = i;
+    if (o < 0) { o = 0; for (int i = 1; i < PRES_OWN_N; i++) if (g_pres_own[t][i].f < g_pres_own[t][o].f) o = i; g_pres2[S][P2_OWNOVER]++; }
+    g_pres_own[t][o].k2 = k2; g_pres_own[t][o].f = f; g_pres_own[t][o].open = 1;
+}
+static int own_hit(int S, uint64_t k10) { int t = own_tab(S); for (int i = 0; i < PRES_OWN_N; i++) if (g_pres_own[t][i].open && pres_hit(k10, g_pres_own[t][i].k2)) return 1; return 0; }
+/* a stop UE got (forwarded, or sent as an own stop) closes the open entries of its start slot that it ends: an id stop its key's, a stop-all the owner's only
+ * when the stop slot's stop-all ends effects (sacl: +0x010 yes, V; +0x030 no, the native lookup of id 0xffffffff finds nothing, V) */
+static void own_close(const PresSpec *stop, uint64_t k10) {
+    if ((uint32_t)k10 == 0xffffffffu && !stop->sacl) return;
+    int t = own_tab(stop->mate);
+    for (int i = 0; i < PRES_OWN_N; i++) if (g_pres_own[t][i].open && pres_hit(k10, g_pres_own[t][i].k2)) g_pres_own[t][i].open = 0;
+}
+static int own_nopen(int S) { int t = own_tab(S), n = 0; for (int i = 0; i < PRES_OWN_N; i++) n += g_pres_own[t][i].open; return n; }
+/* v0.36.0 (OPTA-M2-SPEC.md §26, option b): the sound mirror. UE's sound handler (ALuxBattleSoundEventHandler 0x1403c63c0) files every valid
+ * play of (owner, id) as the LATEST playback of the key (TMap remove 0x1403c6b1f, add 0x1403c6b4e; the older one is never stopped) and its stop (0x1403c7720)
+ * stops only that playback; an older playback of the key can never be stopped again (V). g_mir mirrors, per key, the playback UE tracks (from every
+ * +0x028 / +0x030 UE gets: forwarded live (snd_fwd), late, injected; in UE's receive order) and whether the confirmed timeline's tracked playback may still play
+ * (ref). Owners 1 / 2 (every core site, V), any id but 0xffffffff, in an open-addressed table of MIR_N keys (plays insert, stops look up; a new key is refused at
+ * 3/4 full: mir_full=, no eviction); an unmirrored key gets v0.34.2's behavior (never late, never stopped late). Per battle, step thread, cleared in pres_reset.
+ * kind: the playback UE tracks for the key (none / a live forward / a late call of this plugin); f: its frame; ord: late = the confirmed pass's index i, live =
+ * its PresDlv index in frame f (-1 unknown); alive: it may still play (no stop of the key reached UE since it started); ref / rf: the timeline's tracked playback
+ * may still play / its frame (a stop-all clears ref: the Blueprint side, conservative); poison: a delivery of the key failed (unmirrored until its next forwarded
+ * start). mir_on(): +0x028 is on as a guarded start (h_rb_pres_snd1shot turns the mirror off) and not the harness control h_rb_pres_mir_off; table [1] of the own
+ * entries (+0x028) is not used while it is on */
+#define MIR_N 1024
+enum { MK_NONE = 0, MK_LIVE, MK_LATE };
+typedef struct { uint32_t f, rf; int16_t ord; uint8_t kind, alive, ref, poison, used, pad; uint32_t ow, id; } Mir;   /* 24 bytes */
+static Mir g_mir[MIR_N]; static uint32_t g_mir_n;
+static uint64_t g_mir_full, g_mir_inj, g_mir_injfail, g_mir_untrk, g_mir_lost;   /* refused new keys; injected stops (failed ones); own late playbacks a live start
+                                                                                  * untracked (the control, or a failed injection); sound calls whose key was unreadable */
+static uint32_t g_mir_utr[2];        /* per owner 1 / 2: the timeline's own untrackings mirrored by a late start (a playing playback replaced) since the last stop-all UE got */
+static int g_mir_injlines;           /* RBPRESINJ line budget (200 per battle) */
+static Mir *mir_look(uint32_t ow, uint32_t id, int make) {   /* make: a play (inserts the key) */
+    if ((ow != 1 && ow != 2) || id == 0xffffffffu) return NULL;
+    uint32_t h = (uint32_t)((((uint64_t)ow << 32 | id) * 0x9e3779b97f4a7c15ULL) >> 54);
+    for (int n = 0; n < MIR_N; n++) {
+        Mir *m = &g_mir[(h + (uint32_t)n) & (MIR_N - 1)];
+        if (m->used && m->ow == ow && m->id == id) return m;
+        if (!m->used) { if (!make) return NULL; if (g_mir_n >= MIR_N * 3 / 4) { g_mir_full++; return NULL; } m->used = 1; m->ow = ow; m->id = id; g_mir_n++; return m; }
+    }
+    return NULL;
+}
+static int mir_on(void) { return !RBT(g_pres_mir_off) && ((g_pres_mask >> (0x028 / 8)) & 1) && pres_cls(pres_spec(0x028 / 8)) == PC_START; }
+static int mir_nown(void) { int n = 0; for (int i = 0; i < MIR_N; i++) n += g_mir[i].used && g_mir[i].kind == MK_LATE && g_mir[i].alive; return n; }   /* RBPRES2 own_open= */
+/* the playback UE tracks for the key is NEWER than the confirmed call (f, i): a live start of a later frame; a live start of frame f that is not paired (tier 1 /
+ * tier 2) to a confirmed call before i (unpaired: a stand-in for the timeline's start, as the near window); a late start of frame f after i. A live start claimed
+ * by an earlier frame's near window stands for that frame's start (older) */
+static int mir_newer(const Mir *m, uint32_t f, int i, const PresFrame *P, const uint8_t *used, const int16_t *pair) {
+    if (RBT(g_pres_nonewer)) return 0;
+    if (m->kind == MK_NONE) return 0;
+    if (m->f != f) return m->f > f;
+    if (m->kind == MK_LATE) return m->ord > i;
+    int j = m->ord;
+    if (j < 0 || j >= P->nd) return 1;
+    if (used[j] == 4) return 0;
+    return !(used[j] == 1 || used[j] == 2) || pair[j] > i;
+}
+/* a +0x028 / +0x030 that reaches UE from a forwarding pass (rb_lsn_pre, before the thunk forwards it; every forwarding pass type: live, segment, the straight
+ * passes after an abort): the mirror follows UE's handler. pi = the call's index in g_pass.pc (pres_note; -1 none): its PresDlv index after pres_record is the
+ * frame's delivered calls before this pass + the forwarded calls before it in this pass. A live start that would untrack an own late playback that may still
+ * play gets a +0x030 {owner, id} first, injected inside this pass (modes_lsn_inject) */
+static void snd_fwd(int slot, uint64_t rdx, int pi) {
+    NT_TIB *tib = (NT_TIB *)NtCurrentTeb();   /* rdx must hold 8 readable bytes on the step stack (V: every core site passes a local; R4 badptr=0) */
+    uint64_t lo = (uint64_t)(uintptr_t)tib->StackLimit, hi = (uint64_t)(uintptr_t)tib->StackBase;
+    if (rdx < lo || rdx > hi || hi - rdx < 8) { g_mir_lost++; return; }
+    uint32_t ow, id; memcpy(&ow, (const void *)(uintptr_t)rdx, 4); memcpy(&id, (const void *)(uintptr_t)(rdx + 4), 4);
+    if (slot == 0x030 / 8) {
+        if (id == 0xffffffffu) { if (ow == 1 || ow == 2) g_mir_utr[ow - 1] = 0; }   /* a stop-all: natively a no-op (V, plays reject id < 0); it resets the untrack count */
+        else { Mir *m = mir_look(ow, id, 0); if (m) m->alive = 0; }
+        return;
+    }
+    Mir *m = mir_look(ow, id, 1);
+    if (!m) return;   /* unmirrored key: v0.34.2 */
+    int ord = -1;
+    const Pend *pp = (const Pend *)g_pass.pend;
+    if (pi >= 0 && pp) { int n = pp->pres.nd; for (int j = 0; j < pi; j++) n += g_pass.pc[j].fwd; if (n < PRES_MAXD) ord = n; }
+    if (m->kind == MK_LATE && m->alive && !m->poison) {   /* this live start would untrack the plugin's own late playback: stop it first */
+        if (RBT(g_pres_noinj)) g_mir_untrk++;   /* harness control XGSMI */
+        else {
+            uint8_t q[8]; memcpy(q, &ow, 4); memcpy(q + 4, &id, 4);
+            int ok = modes_lsn_inject(0x030 / 8, q);   /* the stop first, then the thunk forwards the start */
+            g_mir_inj++; if (!ok) { g_mir_injfail++; g_mir_untrk++; }
+            if (g_mir_injlines++ < 200) LOG("RBPRESINJ b=%llu s=%u f=%u pass=%s ow=%u id=0x%x late_f=%u ok=%d\n", (unsigned long long)g_bat, g_s, g_pass.k, rb_lips_pass_name(),
+                                            ow, id, m->f, ok);
+        }
+    }
+    m->kind = MK_LIVE; m->f = g_pass.k; m->ord = (int16_t)ord; m->alive = 1; m->poison = 0;
+}
+/* v0.36.0 (DESIGN.md §2.8): the +0x010 switch, built OFF (harness only: RBT(g_pres_fxlive) is the constant 0 in the plugin). UE's effect stack (V: a +0x010
+ * ends every entry of (owner, id), a stop-all every entry of the owner) mirrored per key; a missed +0x010 that hits no own entry but a live-started alive effect
+ * would go out late (stoplive) unless UE got a start of its key since (ownheld). Making it a real switch later = one ini key in place of RBT(g_pres_fxlive) */
+#define FXM_N 256
+static struct { uint64_t k2; uint8_t used, alive; } g_fxm[FXM_N];
+static int fxm_slot(uint64_t k2, int make) {
+    uint32_t h = (uint32_t)((k2 * 0x9e3779b97f4a7c15ULL) >> 56);
+    for (int n = 0; n < FXM_N; n++) {
+        int x = (int)((h + (uint32_t)n) % FXM_N);
+        if (g_fxm[x].used && g_fxm[x].k2 == k2) return x;
+        if (!g_fxm[x].used) { if (!make) return -1; g_fxm[x].used = 1; g_fxm[x].k2 = k2; g_fxm[x].alive = 0; return x; }
+    }
+    return -1;
+}
+static void fxm_start(uint64_t k2) { int x = fxm_slot(k2, 1); if (x >= 0) g_fxm[x].alive = 1; }
+static void fxm_stop(uint64_t k10) { for (int x = 0; x < FXM_N; x++) if (g_fxm[x].used && pres_hit(k10, g_fxm[x].k2)) g_fxm[x].alive = 0; }
+static int fxm_alive(uint64_t k10) { for (int x = 0; x < FXM_N; x++) if (g_fxm[x].used && g_fxm[x].alive && pres_hit(k10, g_fxm[x].k2)) return 1; return 0; }
+static void fx_fwd(int slot, uint64_t rdx) {   /* a +0x008 / +0x010 that reaches UE from a forwarding pass (rb_lsn_pre, only under the switch) */
+    NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+    uint64_t lo = (uint64_t)(uintptr_t)tib->StackLimit, hi = (uint64_t)(uintptr_t)tib->StackBase;
+    if (rdx < lo || rdx > hi || hi - rdx < 12) return;
+    uint8_t t[16]; memset(t, 0, sizeof t); memcpy(t, (const void *)(uintptr_t)rdx, 12);
+    const PresSpec *sp = pres_spec(slot); if (!sp) return;
+    if (slot == 0x008 / 8) fxm_start(pres_k2(sp, t)); else fxm_stop(pres_k2(sp, t));
+}
+/* v0.35.0: the orphan ring of the near-capable slots: a delivered call no confirmed call of its frame paired (UE has it, the timeline does not), kept
+ * PRES_NEAR_W frames for the near window of the next frames */
+#define PRES_ORW_N 64
+static struct { uint64_t idh; uint32_t f; uint8_t slot, claimed; } g_pres_orw[PRES_ORW_N]; static int g_pres_norw;
+static void orw_push(uint32_t f, int slot, uint64_t idh) {
+    int w = 0;
+    for (int r = 0; r < g_pres_norw; r++) if (g_pres_orw[r].f + PRES_NEAR_W >= f) g_pres_orw[w++] = g_pres_orw[r];   /* older than f - 3: no later frame claims it */
+    g_pres_norw = w;
+    if (g_pres_norw == PRES_ORW_N) { memmove(&g_pres_orw[0], &g_pres_orw[1], sizeof g_pres_orw[0] * (PRES_ORW_N - 1)); g_pres_norw--; }
+    g_pres_orw[g_pres_norw].idh = idh; g_pres_orw[g_pres_norw].f = f; g_pres_orw[g_pres_norw].slot = (uint8_t)slot; g_pres_orw[g_pres_norw].claimed = 0; g_pres_norw++;
+}
+/* the late deliveries of one confirm_upto (flushed together: one batch per step); v0.35.0: RbLate (+ r8 / r9, the 0x48-byte copy) */
 #define PRESQ_N 64
-static uint8_t g_presq_slot[PRESQ_N], g_presq_pay[PRESQ_N][PRES_PAY]; static int g_npresq;
+static RbLate g_presq[PRESQ_N]; static int g_npresq;
 static void pres_flush(void) {
     if (!g_npresq) return;
+    lipsync_guard_before_late(g_s);   /* LIPSYNC: v0.36.0 the pending guard is checked before UE gets late calls (DESIGN.md §3.4) */
     uint64_t t0 = qpc();
-    int done = modes_lsn_deliver(g_npresq, g_presq_slot, g_presq_pay, !RBT(g_pres_nol4));
+    int done = modes_lsn_deliver(g_npresq, g_presq, !RBT(g_pres_nol4));
     double us = qpc_us(qpc() - t0);
     g_pres_us += us; if (us > g_pres_us_max) g_pres_us_max = us;
     g_pres_batches++; g_pres_calls += (uint64_t)(done > 0 ? done : 0);
+    if (done != g_npresq)   /* v0.36.0: an undelivered sound call poisons its key in the mirror (unmirrored until its next forwarded start: v0.34.2 for it) */
+        for (int i = done > 0 ? done : 0; i < g_npresq; i++)
+            if (g_presq[i].slot == 0x028 / 8 || g_presq[i].slot == 0x030 / 8) { uint32_t ow, id; memcpy(&ow, g_presq[i].pay, 4); memcpy(&id, g_presq[i].pay + 4, 4); Mir *m = mir_look(ow, id, 0); if (m) m->poison = 1; }
     if (done != g_npresq) { g_pres_fail += (uint64_t)(g_npresq - (done > 0 ? done : 0)); if (g_pres_fail <= 3) LOG("RBPRES deliver FAIL n=%d done=%d (UE's listener was not reachable between passes: those calls were dropped)\n", g_npresq, done); }
     g_npresq = 0;
 }
-static void pres_queue(int slot, const uint8_t *pay, uint32_t lat) {
+static void pres_enq(int slot, const uint8_t *pay, uint64_t r8, uint64_t r9) {   /* v0.35.0: one RbLate entry (a late call or a repair) */
     if (g_npresq == PRESQ_N) pres_flush();
-    g_presq_slot[g_npresq] = (uint8_t)slot; memcpy(g_presq_pay[g_npresq], pay, PRES_PAY); g_npresq++;
+    RbLate *q = &g_presq[g_npresq++];
+    memset(q, 0, sizeof *q); q->slot = (uint8_t)slot; q->r8 = r8; q->r9 = r9; memcpy(q->pay, pay, RB_LATE_PAY);
+    if (RBT(g_pres_noregs)) q->r8 = q->r9 = 0;                                  /* harness control XGSXR */
+    if (RBT(g_pres_pay30)) memset(q->pay + 0x30, 0, RB_LATE_PAY - 0x30);       /* harness control XGSXP */
+}
+static void pres_queue(int slot, const uint8_t *pay, uint64_t r8, uint64_t r9, uint32_t lat) {
+    pres_enq(slot, pay, r8, r9);
     g_pres_late++; g_pres_lat_sum += lat; if (lat > g_pres_lat_max) g_pres_lat_max = lat; g_pres_lat_hist[lat < 15 ? lat : 15]++;
 }
-/* a call of a presentation slot inside a pass (step thread): its payload, whether this pass forwards it to UE */
-static void pres_note(int slot, uint64_t rdx, int fwd) {
+/* a call of a presentation slot inside a pass (step thread): its payload, whether this pass forwards it to UE; v0.35.0: + r8 / r9 (the forwarding thunk's
+ * saved copies, src/fwd_thunks.S [rbp-0x30] / [rbp-0x38], crsp = rbp + 0x10, read like tr_note). v0.36.0: returns the call's index in g_pass.pc (-1: not a spec
+ * slot, over, badptr), from which snd_fwd computes the call's PresDlv index */
+static int pres_note(int slot, uint64_t rdx, uint64_t crsp, int fwd) {
     const PresSpec *sp = pres_spec(slot);
-    if (!sp) return;
-    if (g_pass.pn >= PRES_MAXC) { g_pass.pover++; return; }
-    NT_TIB *tib = (NT_TIB *)NtCurrentTeb();   /* both core call sites pass a local of the step's stack (V); anything else is not read */
-    if (rdx < (uint64_t)(uintptr_t)tib->StackLimit || rdx + PRES_PAY > (uint64_t)(uintptr_t)tib->StackBase) { g_pres_badptr++; return; }
+    if (!sp) return -1;
+    if (g_pass.pn >= PRES_MAXC) { g_pass.pover++; return -1; }
+    NT_TIB *tib = (NT_TIB *)NtCurrentTeb();   /* every core call site passes a local of the step's stack (V); anything else is not read */
+    uint64_t lo = (uint64_t)(uintptr_t)tib->StackLimit, hi = (uint64_t)(uintptr_t)tib->StackBase;   /* v0.34.2 review fix MAJOR-1: rdx + PRES_PAY could wrap */
+    if (rdx < lo || rdx > hi || hi - rdx < PRES_PAY) { g_pres_badptr++; return -1; }
     PresCall *c = &g_pass.pc[g_pass.pn++];
     memset(c, 0, sizeof *c); c->slot = (uint8_t)slot; c->fwd = (uint8_t)(fwd != 0);
     for (int i = 0; i < sp->n; i++) memcpy(c->pay + sp->off[i], (const void *)(uintptr_t)(rdx + sp->off[i]), sp->len[i]);
-    c->h = pres_hash(slot, c->pay);
-    c->idh = pres_idh(slot, c->pay);   /* review fix M1 */
+    if (crsp >= lo + 0x48 && crsp <= hi) { memcpy(&c->r8, (const void *)(uintptr_t)(crsp - 0x40), 8); memcpy(&c->r9, (const void *)(uintptr_t)(crsp - 0x48), 8); c->regs = 1; }
+    else g_pres2[slot][P2_NOREGS]++;
+    c->h = pres_hash(slot, c->pay, c->r8, c->r9);
+    c->idh = pres_idh(sp, c->pay, c->r8, c->r9);   /* review fix M1 */
+    return g_pass.pn - 1;
 }
-/* after a recorded (non-RPB) pass of frame k: the frame's last calls, its delivered set, the pass in the history; UE's latest value per key */
+/* after a recorded (non-RPB) pass of frame k: the frame's last calls, its delivered set, the pass in the history; UE's latest value per key; v0.35.0: a
+ * forwarded +0x010 closes every own entry it hits (UE got that stop) */
 static void pres_record(Pend *p, uint32_t k) {
     PresFrame *P = &p->pres;
     if (!g_pres_mask) return;
     P->nl = g_pass.pn; memcpy(P->last, g_pass.pc, sizeof(PresCall) * (size_t)g_pass.pn);
     P->over += g_pass.pover; g_pres_over += (uint64_t)g_pass.pover;
     if (P->nh == PRES_HIST) { memmove(&P->hist[0], &P->hist[1], sizeof P->hist[0] * (PRES_HIST - 1)); P->nh--; }
-    P->hist[P->nh].s = g_pass.s; P->hist[P->nh].n = g_pass.pn;
-    for (int i = 0; i < g_pass.pn; i++) P->hist[P->nh].h[i] = g_pass.pc[i].h;
+    P->hist[P->nh].s = g_pass.s; P->hist[P->nh].n = 0;
+    for (int i = 0; i < g_pass.pn; i++) if (!pres_is_watch(g_pass.pc[i].slot)) P->hist[P->nh].h[P->hist[P->nh].n++] = g_pass.pc[i].h;   /* v0.35.0: cf_orphan: no +0x010
+                                                                                                                                       * (review fix M1: nor +0x030) */
     P->nh++;
     for (int i = 0; i < g_pass.pn; i++) {
         const PresCall *c = &g_pass.pc[i];
         if (!c->fwd) continue;
         const PresSpec *sp = pres_spec(c->slot);
-        if (P->nd < PRES_MAXD) { PresDlv *d = &P->dlv[P->nd++]; d->h = c->h; d->idh = c->idh; d->slot = c->slot; d->has_key = sp && sp->key; d->key = d->has_key ? pres_key(c) : 0; }
-        if (sp && sp->key) { PresKey *u = pres_key_get(g_pres_ue, pres_key(c), 1); u->f = k; memcpy(u->pay, c->pay, PRES_PAY); }
+        if (P->nd < PRES_MAXD) { PresDlv *d = &P->dlv[P->nd++]; memset(d, 0, sizeof *d); d->h = c->h; d->idh = c->idh; d->slot = c->slot; d->has_key = sp && sp->key; d->key = d->has_key ? pres_key(c) : 0;
+                                 d->k2 = sp ? pres_k2(sp, c->pay) : 0; }
+        if (sp && sp->key) { PresKey *u = pres_key_get(g_pres_ue, pres_key(c), 1); u->f = k; u->r8 = c->r8; u->r9 = c->r9; memcpy(u->pay, c->pay, PRES_PAY); }
+        if (sp && sp->cls == PC_STOPW) own_close(sp, pres_k2(sp, c->pay));   /* v0.35.0 (review fix M1: + +0x030, per its start slot's table) */
     }
+}
+/* v0.35.0: the stop guard. UE already got a stop that hits the start's key k8: a delivered stop (slot SS = the start's watched stop slot: +0x010 for +0x008,
+ * +0x030 for +0x028, review fix M1) of a later frame (f, s-1] (delivered live, not confirmed yet), or of frame f itself unless that stop is tier-1 paired to a
+ * confirmed stop that comes BEFORE the start (index i) in the confirmed pass's call order (a stop-then-restart in one frame). v0.36.0: + the hit function (pres_hit
+ * for +0x008 / +0x028; vstop_hit for the voice's +0x040) */
+static int stop_seen(uint32_t f, uint32_t s, int SS, uint64_t k8, int i, const Pend *p, const uint8_t *used, const int16_t *pair, int (*hit)(uint64_t, uint64_t)) {
+    const PresFrame *P = &p->pres;
+    for (int j = 0; j < P->nd; j++)
+        if (P->dlv[j].slot == SS && hit(P->dlv[j].k2, k8) && (used[j] != 1 || pair[j] > i)) return 1;
+    for (uint32_t g = f + 1; g < s; g++) {
+        const Pend *q = pend_at(g); if (!q) continue;
+        for (int j = 0; j < q->pres.nd; j++) if (q->pres.dlv[j].slot == SS && hit(q->pres.dlv[j].k2, k8)) return 1;
+    }
+    return 0;
+}
+/* v0.36.0: the voice's supersede. UE already got a +0x038 of the same mapped owner delivered live in a frame of (f, s-1] (a newer voice replaces the older one's lip
+ * channel, 0x1402f77c0, V): a late voice of f now would play an older line after the newer one. No late voice of a newer frame can be queued before f's
+ * (confirmations run in frame order) */
+static int voice_newer_seen(uint32_t f, uint32_t s, uint64_t k38) {
+    for (uint32_t g = f + 1; g < s; g++) {
+        const Pend *q = pend_at(g); if (!q) continue;
+        for (int j = 0; j < q->pres.nd; j++) if (q->pres.dlv[j].slot == 0x038 / 8 && vown((uint32_t)(q->pres.dlv[j].k2 >> 32)) == vown((uint32_t)(k38 >> 32))) return 1;
+    }
+    return 0;
+}
+/* v0.35.0: UE got a start (slot S: +0x008 for a +0x010 stop, +0x028 for a +0x030 stop, review fix M1) whose key the stop k10 hits in a frame of [f, s-1] (an
+ * own stop now would kill that newer instance: UE's sound handler stops the LATEST playback of (owner, id)) */
+static int start_seen(uint32_t f, uint32_t s, int S, uint64_t k10, const Pend *p) {
+    for (uint32_t g = f; g < s; g++) {
+        const Pend *q = g == f ? p : pend_at(g); if (!q) continue;
+        for (int j = 0; j < q->pres.nd; j++) if (q->pres.dlv[j].slot == S && pres_hit(k10, q->pres.dlv[j].k2)) return 1;
+    }
+    return 0;
+}
+/* v0.35.0: the near window. A confirmed call of slot S (identity idh) that UE got 1 to 3 frames off: the first unclaimed orphan of the same identity in the
+ * frames [f-3, f-1] (already confirmed; not in the confirmed timeline), else the first unclaimed delivered call of the same identity in a not yet confirmed
+ * frame of [f+1, min(f+3, s-1)] (claimed: that frame's tiers 1 / 2 skip it and its count gate subtracts it, so its own confirmed call can go out late).
+ * Either way UE plays as many calls of the identity inside the window as the confirmed timeline has */
+static int near_claim(uint32_t f, uint32_t s, int S, uint64_t idh) {
+    for (int r = 0; r < g_pres_norw; r++)
+        if (!g_pres_orw[r].claimed && g_pres_orw[r].slot == S && g_pres_orw[r].idh == idh && g_pres_orw[r].f < f && g_pres_orw[r].f + PRES_NEAR_W >= f) { g_pres_orw[r].claimed = 1; return 1; }
+    for (uint32_t g = f + 1; g <= f + PRES_NEAR_W && g < s; g++) {
+        Pend *q = pend_at(g); if (!q) continue;
+        for (int j = 0; j < q->pres.nd; j++) { PresDlv *d = &q->pres.dlv[j]; if (d->slot == S && !d->claimed && d->idh == idh) { d->claimed = 1; return 1; } }
+    }
+    return 0;
 }
 /* frame f is confirmed at step s (its last pass is the timeline). Missed calls go into the batch (once), orphans are counted (and repaired for a key).
  * v0.33.0 review fix M1 (OPTA-M2-SPEC.md §22.9): +0x128 (a positioned one-shot that cannot be undone) is matched in three tiers:
@@ -570,53 +881,205 @@ static void pres_record(Pend *p, uint32_t k) {
  *   3. the count gate: of the rest, at most (the confirmed pass's +0x128 calls - the +0x128 calls UE got for this frame) go out late; the others are
  *      `withheld` (UE already showed as many +0x128 effects for this frame as the timeline has: v0.32.0's behavior for them).
  * So UE never gets more +0x128 calls for a frame than max(what it got live, what the confirmed pass made): no effect twice. v0.33.0's first rule
- * (tier 1 only) delivered a content-mismatched call next to its live twin: that is the harness control h_rb_pres_128old (XFX128, XGFX128). */
+ * (tier 1 only) delivered a content-mismatched call next to its live twin: that is the harness control h_rb_pres_128old (XFX128, XGFX128).
+ * v0.35.0 (OPTA-M2-SPEC.md §25): the three tiers hold for every one-shot / start slot (+0x008, +0x028, +0x128; +0x128's decisions are byte-identical);
+ * per call, in the confirmed pass's order: held (tier 3), then (a start) stopped (the stop guard), then near (the near window, +0x008 / +0x028), then late.
+ * A start sent late or credited near opens an own entry; a confirmed +0x010 UE never got that hits an open entry goes out late (ownstop) unless UE got a
+ * newer start of its key (ownheld); one that hits none is left alone (stop_notown, v0.34.2's behavior). Review fix M1: +0x028 (the sound) is a start
+ * like +0x008, with +0x030 (the sound stop) as its watched stop slot: the stop guard, the own entries and the own stop hold for it too.
+ * v0.36.0 (OPTA-M2-SPEC.md §26, option b): with the sound mirror on (mir_on), +0x028 / +0x030 are decided on what UE tracks per key (UE keeps only the LATEST
+ * playback of (owner, id), V): before tier 1 the timeline walk B0 (ref / rf per key, in the confirmed pass's order); a missed +0x028 after held / stopped / near:
+ * B1 (unmir: the key is not mirrored; newer: UE tracks a newer playback of it; sync: UE may still play an older playback that is not the timeline's own, so a
+ * +0x030 of the key goes first) then late; a missed +0x030 id stop: B2 (stop_notown unless UE tracks an older playback of the key that may still play; ownheld
+ * when UE tracks a newer one; else late: ownstop, or stoplive for a live-started one); a missed stop-all: B3 (sent when UE may still play an older playback of
+ * the owner, or the timeline untracked one of its own playing playbacks: sallforce; held when UE got a start of the owner since f: then its own late
+ * playbacks get one id stop each, expand). The voice +0x038 (PC_VOICE): held -> stopped (a real +0x040 of the owner, vstop_hit) -> near -> sup -> late. */
 static void pres_confirm(uint32_t f, uint32_t s, Pend *p) {
     PresFrame *P = &p->pres;
     const int S8 = 0x128 / 8;
-    uint8_t used[PRES_MAXD]; memset(used, 0, sizeof used);   /* a delivered call: 1 = tier 1 (the same call), 2 = tier 2 (the same +0x128 effect, moved) */
-    uint8_t cm[PRES_MAXC]; memset(cm, 0, sizeof cm);         /* a confirmed call: the same */
+    static const int k_os[4] = { 0x008 / 8, 0x028 / 8, 0x128 / 8, 0x038 / 8 };   /* v0.35.0: the one-shot and start slots; v0.36.0: + the voice (appended) */
+    uint8_t used[PRES_MAXD]; int16_t pair[PRES_MAXD];   /* a delivered call: 1 = tier 1 (the same call), 2 = tier 2 (the same effect, moved), 4 = claimed by the
+                                                         * near window of another frame (v0.35.0); pair = the tier-1 partner's index in the confirmed pass
+                                                         * (v0.36.0: + tier 2's; stop_seen reads it only for used 1) */
+    uint8_t cm[PRES_MAXC]; memset(cm, 0, sizeof cm);   /* a confirmed call: 1 = tier 1, 2 = tier 2 */
+    for (int j = 0; j < P->nd; j++) { used[j] = P->dlv[j].claimed ? 4 : 0; pair[j] = -1; }
+    /* v0.36.0 B0: the timeline walk. refb[i] / reff[i] = the timeline's tracked playback of call i's key may still play / its frame, just before call i */
+    uint8_t refb[PRES_MAXC]; uint32_t reff[PRES_MAXC]; memset(refb, 1, sizeof refb); memset(reff, 0, sizeof reff);
+    const int mirsnd = mir_on();
+    if (mirsnd) for (int i = 0; i < P->nl; i++) {
+        const PresCall *c = &P->last[i];
+        if (c->slot != 0x028 / 8 && c->slot != 0x030 / 8) continue;
+        uint32_t ow, id; memcpy(&ow, c->pay, 4); memcpy(&id, c->pay + 4, 4);
+        if (c->slot == 0x030 / 8 && id == 0xffffffffu) { for (int x = 0; x < MIR_N; x++) if (g_mir[x].used && g_mir[x].ow == ow) g_mir[x].ref = 0; continue; }
+        Mir *m = mir_look(ow, id, c->slot == 0x028 / 8); if (!m) continue;
+        if (c->slot == 0x028 / 8) { refb[i] = m->ref; reff[i] = m->rf; m->ref = 1; m->rf = f; } else m->ref = 0;
+    }
     for (int i = 0; i < P->nl; i++)
-        for (int j = 0; j < P->nd; j++) if (!used[j] && P->dlv[j].h == P->last[i].h) { used[j] = 1; cm[i] = 1; break; }
-    { int nc = 0, nd = 0;   /* a content-mismatch frame: a +0x128 call on each side without a byte-identical partner (v0.33.0's first rule doubled them) */
-      for (int i = 0; i < P->nl; i++) if (!cm[i] && P->last[i].slot == S8) nc++;
-      for (int j = 0; j < P->nd; j++) if (!used[j] && P->dlv[j].slot == S8) nd++;
-      if (nc && nd) g_pres_cm++; }
+        for (int j = 0; j < P->nd; j++) if (!used[j] && P->dlv[j].h == P->last[i].h) { used[j] = 1; cm[i] = 1; pair[j] = (int16_t)i; break; }
+    for (int a = 0; a < 4; a++) {   /* a content-mismatch frame: a call of the slot on each side without a byte-identical partner (v0.33.0's first rule doubled them) */
+        int S = k_os[a], nc = 0, nd = 0;
+        for (int i = 0; i < P->nl; i++) if (!cm[i] && P->last[i].slot == S) nc++;
+        for (int j = 0; j < P->nd; j++) if (!used[j] && P->dlv[j].slot == S) nd++;
+        if (nc && nd) { if (S == S8) g_pres_cm++; else g_pres2[S][P2_CM]++; }
+    }
     int old128 = RBT(g_pres_128old) != 0, id128 = !old128 && !RBT(g_pres_128noid);
-    if (id128)
-        for (int i = 0; i < P->nl; i++) {
-            if (cm[i] || P->last[i].slot != S8) continue;
-            for (int j = 0; j < P->nd; j++) if (!used[j] && P->dlv[j].slot == S8 && P->dlv[j].idh == P->last[i].idh) { used[j] = 2; cm[i] = 2; g_pres_moved++; break; }
-        }
-    int allow8 = (int)p->calls[S8] - (int)p->fwd[S8], late8 = 0;   /* the count gate: what the confirmed pass made beyond what UE got (any pass) */
-    if (allow8 < 0) allow8 = 0;
+    for (int i = 0; i < P->nl; i++) {   /* tier 2 */
+        const PresCall *c = &P->last[i]; const PresSpec *sp = pres_spec(c->slot);
+        if (cm[i] || !sp || (sp->cls != PC_ONESHOT && sp->cls != PC_START && sp->cls != PC_VOICE) || (c->slot == S8 && !id128)) continue;   /* v0.36.0: + the voice (no
+                                                                                                                                            * position: tier 2 = tier 1) */
+        for (int j = 0; j < P->nd; j++)
+            if (!used[j] && P->dlv[j].slot == c->slot && P->dlv[j].idh == c->idh) {
+                used[j] = 2; cm[i] = 2; pair[j] = (int16_t)i;   /* v0.36.0: + the pair index (mir_newer; stop_seen reads it only for used 1) */
+                if (c->slot == S8) g_pres_moved++; else g_pres2[c->slot][P2_MOVED]++;
+                tr_pres(f, c->slot, "moved", c->pay, c->r8, c->r9);
+                break;
+            }
+    }
+    int allow[LISTENER_NSLOTS], late_n[LISTENER_NSLOTS]; memset(allow, 0, sizeof allow); memset(late_n, 0, sizeof late_n);
+    for (int a = 0; a < 4; a++) {   /* the count gate: what the confirmed pass made beyond what UE got (any pass; a call claimed by another frame does not count) */
+        int S = k_os[a], ncl = 0;
+        for (int j = 0; j < P->nd; j++) if (used[j] == 4 && P->dlv[j].slot == S) ncl++;
+        int al = (int)p->calls[S] - ((int)p->fwd[S] - ncl);
+        allow[S] = al < 0 ? 0 : al;
+    }
+    int nostopg = RBT(g_pres_nostopg) != 0, nonear = RBT(g_pres_nonear) != 0, noown = RBT(g_pres_noown) != 0;
+    uint32_t lat = s >= f ? s - f : 0;
     for (int i = 0; i < P->nl; i++) {
         if (cm[i]) continue;
         const PresCall *c = &P->last[i];
         const PresSpec *sp = pres_spec(c->slot);
-        if (sp && sp->key) {
-            PresKey *u = pres_key_get(g_pres_ue, pres_key(c), 0);
-            if (u && u->f > f) { p->pres_sup[c->slot]++; g_pres_sup++; continue; }   /* UE already holds a newer frame's value of this key */
+        if (!sp) continue;
+        int S = c->slot;
+        if (sp->cls == PC_VALUE) {   /* +0x120: v0.33.0, unchanged */
+            if (sp->key) {
+                PresKey *u = pres_key_get(g_pres_ue, pres_key(c), 0);
+                if (u && u->f > f) { p->pres_sup[S]++; g_pres_sup++; tr_pres(f, S, "sup", c->pay, c->r8, c->r9); continue; }   /* UE already holds a newer frame's value of this key */
+            }
+            pres_queue(S, c->pay, c->r8, c->r9, lat);
+            p->pres_late[S]++;
+            tr_pres(f, S, "late", c->pay, c->r8, c->r9);
+            if (sp->key) { PresKey *u = pres_key_get(g_pres_ue, pres_key(c), 1); u->f = f; u->r8 = c->r8; u->r9 = c->r9; memcpy(u->pay, c->pay, PRES_PAY); }
+            continue;
         }
-        if (c->slot == S8) {
-            if (!old128 && late8 >= allow8) { g_pres_held++; continue; }   /* UE already showed as many +0x128 effects for this frame */
-            late8++;
+        int cls = pres_cls(sp);   /* review fix M1: +0x028 is a start (the harness control h_rb_pres_snd1shot: the pre-fix one-shot) */
+        if (cls == PC_VWATCH) continue;   /* v0.36.0: a +0x040 is never delivered and closes nothing (a missed voice stop stays missed) */
+        if (cls == PC_STOPW) {   /* v0.35.0: a confirmed stop UE never got (review fix M1: + +0x030, the sound stop; counters under its start slot SS) */
+            if (noown) continue;
+            int SS = sp->mate;
+            uint64_t k = pres_k2(sp, c->pay);
+            if (S == 0x030 / 8 && mirsnd) {   /* v0.36.0 (option b): a confirmed sound stop UE missed, decided on the mirror */
+                uint32_t ow = (uint32_t)(k >> 32);
+                if ((uint32_t)k == 0xffffffffu) {   /* B3, a stop-all: natively a no-op (V); sent when UE may still play an older playback of the owner, or the timeline
+                                                     * untracked one of its own playing playbacks (the Blueprint may stop them: conservative) */
+                    int any = 0;
+                    if ((ow == 1 || ow == 2) && !g_mir_lost)
+                        for (int x = 0; x < MIR_N && !any; x++) { const Mir *m = &g_mir[x]; any = m->used && m->ow == ow && m->kind != MK_NONE && m->alive && !m->poison && !mir_newer(m, f, i, P, used, pair); }
+                    int utr = (ow == 1 || ow == 2) && !RBT(g_pres_noforce) ? (int)g_mir_utr[ow - 1] : 0;
+                    if (!any && !utr) { g_pres2[SS][P2_NOTOWN]++; continue; }
+                    int seen = start_seen(f, s, SS, k, p);
+                    if (!utr && seen) {   /* UE got a start of the owner since f: the stop-all would end it; the own late playbacks it should end get one id stop each */
+                        g_pres2[SS][P2_OWNHELD]++; tr_pres(f, S, "ownheld", c->pay, c->r8, c->r9);
+                        if (!RBT(g_pres_noexpand))
+                            for (int x = 0; x < MIR_N; x++) {
+                                Mir *m = &g_mir[x];
+                                if (!m->used || m->ow != ow || m->kind != MK_LATE || !m->alive || m->poison || mir_newer(m, f, i, P, used, pair)) continue;
+                                uint8_t q6[PRES_PAY]; memset(q6, 0, sizeof q6); memcpy(q6, &m->ow, 4); memcpy(q6 + 4, &m->id, 4);
+                                pres_enq(S, q6, 0, 0); m->alive = 0; g_pres2[SS][P2_EXPAND]++; tr_pres(f, S, "expand", q6, 0, 0);
+                            }
+                        continue;
+                    }
+                    pres_queue(S, c->pay, c->r8, c->r9, lat); p->pres_late[S]++; g_pres2[SS][P2_OWNSTOP]++;
+                    if (utr && seen) g_pres2[SS][P2_FORCE]++;
+                    g_mir_utr[ow - 1] = 0;
+                    tr_pres(f, S, utr && seen ? "sallforce" : "ownstop", c->pay, c->r8, c->r9);
+                    continue;
+                }
+                uint32_t id = (uint32_t)k;   /* B2, an id stop */
+                Mir *m = g_mir_lost ? NULL : mir_look(ow, id, 0);
+                if (!m || m->poison || m->kind == MK_NONE || !m->alive) { g_pres2[SS][P2_NOTOWN]++; continue; }   /* UE tracks no playback of the key that may play */
+                if (m->kind == MK_LIVE && RBT(g_pres_nostoplive)) { g_pres2[SS][P2_NOTOWN]++; continue; }    /* harness control: v0.35.0's own-only stops */
+                if (mir_newer(m, f, i, P, used, pair)) { g_pres2[SS][P2_OWNHELD]++; tr_pres(f, S, "ownheld", c->pay, c->r8, c->r9); continue; }   /* it would stop a newer playback */
+                pres_queue(S, c->pay, c->r8, c->r9, lat);
+                p->pres_late[S]++; g_pres2[SS][P2_OWNSTOP]++; if (m->kind == MK_LIVE) g_pres2[SS][P2_STOPLIVE]++;
+                tr_pres(f, S, m->kind == MK_LIVE ? "stoplive" : "ownstop", c->pay, c->r8, c->r9);
+                m->alive = 0;
+                continue;
+            }
+            if (S == 0x010 / 8 && RBT(g_pres_fxlive) && !own_hit(SS, k) && fxm_alive(k)) {   /* v0.36.0 the +0x010 switch (harness only): a live-started effect's missed stop */
+                if (start_seen(f, s, SS, k, p)) { g_pres2[SS][P2_OWNHELD]++; tr_pres(f, S, "ownheld", c->pay, c->r8, c->r9); continue; }
+                pres_queue(S, c->pay, c->r8, c->r9, lat); p->pres_late[S]++; g_pres2[SS][P2_OWNSTOP]++; g_pres2[SS][P2_STOPLIVE]++; fxm_stop(k);
+                tr_pres(f, S, "stoplive", c->pay, c->r8, c->r9);
+                continue;
+            }
+            if (!own_hit(SS, k)) { g_pres2[SS][P2_NOTOWN]++; continue; }   /* not a start this plugin sent: v0.34.2's behavior */
+            if (start_seen(f, s, SS, k, p)) { g_pres2[SS][P2_OWNHELD]++; tr_pres(f, S, "ownheld", c->pay, c->r8, c->r9); continue; }   /* it would kill a newer instance */
+            pres_queue(S, c->pay, c->r8, c->r9, lat);
+            p->pres_late[S]++; own_close(sp, k); g_pres2[SS][P2_OWNSTOP]++; if (RBT(g_pres_fxlive) && S == 0x010 / 8) fxm_stop(k);
+            tr_pres(f, S, "ownstop", c->pay, c->r8, c->r9);
+            continue;
         }
-        pres_queue(c->slot, c->pay, s >= f ? s - f : 0);
-        p->pres_late[c->slot]++;
-        if (sp && sp->key) { PresKey *u = pres_key_get(g_pres_ue, pres_key(c), 1); u->f = f; memcpy(u->pay, c->pay, PRES_PAY); }
+        /* PC_ONESHOT / PC_START / PC_VOICE (v0.36.0) */
+        if (!(S == S8 && old128) && late_n[S] >= allow[S]) {   /* UE already showed as many calls of this slot for this frame */
+            if (S == S8) g_pres_held++; else g_pres2[S][P2_HELD]++;
+            tr_pres(f, S, "held", c->pay, c->r8, c->r9);
+            continue;
+        }
+        if (cls == PC_START && !nostopg && stop_seen(f, s, sp->mate, pres_k2(sp, c->pay), i, p, used, pair, pres_hit)) {   /* v0.35.0: its stop already reached UE */
+            g_pres2[S][P2_STOPPED]++; tr_pres(f, S, "stopped", c->pay, c->r8, c->r9);
+            continue;
+        }
+        if (cls == PC_VOICE && !nostopg && stop_seen(f, s, sp->mate, pres_k2(sp, c->pay), i, p, used, pair, vstop_hit)) {   /* v0.36.0: a real voice stop of the owner reached UE */
+            g_pres2[S][P2_STOPPED]++; tr_pres(f, S, "stopped", c->pay, c->r8, c->r9);
+            continue;
+        }
+        if (sp->nearw && !nonear && near_claim(f, s, S, c->idh)) {   /* v0.35.0: UE got it 1 to 3 frames off */
+            p->pres_near[S]++; g_pres2[S][P2_NEAR]++; tr_pres(f, S, "near", c->pay, c->r8, c->r9);
+            if (cls == PC_START && !(S == 0x028 / 8 && mirsnd)) own_open(S, pres_k2(sp, c->pay), f);   /* v0.36.0: a sound's live stand-in is mirrored already; voices have none */
+            continue;
+        }
+        if (cls == PC_VOICE && !RBT(g_pres_nosupv) && voice_newer_seen(f, s, pres_k2(sp, c->pay))) {   /* v0.36.0: UE already got a newer voice of the owner */
+            p->pres_sup[S]++; g_pres_sup++; g_pres2[S][P2_SUP]++; tr_pres(f, S, "sup", c->pay, c->r8, c->r9);
+            continue;
+        }
+        Mir *mm = NULL;
+        if (S == 0x028 / 8 && mirsnd) {   /* v0.36.0 (option b) B1 */
+            uint32_t ow, id; memcpy(&ow, c->pay, 4); memcpy(&id, c->pay + 4, 4);
+            mm = g_mir_lost ? NULL : mir_look(ow, id, 1);
+            if (!mm || mm->poison) { g_pres2[S][P2_MIROUT]++; tr_pres(f, S, "unmir", c->pay, c->r8, c->r9); continue; }   /* unmirrored: v0.34.2 (not sent) */
+            if (mir_newer(mm, f, i, P, used, pair)) { g_pres2[S][P2_NEWER]++; tr_pres(f, S, "newer", c->pay, c->r8, c->r9); continue; }   /* UE tracks a newer playback */
+            int same = refb[i] && mm->f + PRES_NEAR_W >= reff[i] && reff[i] + PRES_NEAR_W >= mm->f;   /* UE tracks the timeline's own playing playback (or its stand-in) */
+            if (mm->alive && same) g_mir_utr[ow - 1]++;   /* the timeline untracks its playing playback here too */
+            if (mm->alive && !same && !RBT(g_pres_nosync)) {   /* UE may still play an older playback that is not the timeline's playing one: stop it first */
+                uint8_t q6[PRES_PAY]; memset(q6, 0, sizeof q6); memcpy(q6, c->pay, 8);
+                pres_enq(0x030 / 8, q6, 0, 0); g_pres2[S][P2_SYNC]++; tr_pres(f, 0x030 / 8, "sync", q6, 0, 0);
+                mm->alive = 0;
+            }
+        }
+        late_n[S]++;
+        pres_queue(S, c->pay, c->r8, c->r9, lat);
+        p->pres_late[S]++;
+        if (S != S8) g_pres2[S][P2_LATE]++;
+        tr_pres(f, S, "late", c->pay, c->r8, c->r9);
+        if (mm) { mm->kind = MK_LATE; mm->f = f; mm->ord = (int16_t)i; mm->alive = 1; }   /* v0.36.0: UE now tracks this late playback */
+        else if (cls == PC_START) own_open(S, pres_k2(sp, c->pay), f);
+        if (RBT(g_pres_fxlive) && S == 0x008 / 8) fxm_start(pres_k2(sp, c->pay));
     }
-    if (late8) {   /* a possible double: a +0x128 delivered late in a frame where UE also holds an unpaired +0x128 guess (RBPRES128 dbl_frames) */
-        g_pres_l128 += (uint64_t)late8;
-        for (int j = 0; j < P->nd; j++) if (!used[j] && P->dlv[j].slot == S8) { g_pres_dbl++; break; }
+    for (int a = 0; a < 4; a++) {   /* a possible double: a late call of the slot in a frame where UE also holds an unpaired call of it (RBPRES128 / RBPRES2 dbl_frames) */
+        int S = k_os[a];
+        if (!late_n[S]) continue;
+        if (S == S8) g_pres_l128 += (uint64_t)late_n[S];
+        for (int j = 0; j < P->nd; j++) if (!used[j] && P->dlv[j].slot == S) { if (S == S8) g_pres_dbl++; else g_pres2[S][P2_DBL]++; break; }
     }
     for (int i = 0; i < P->nl; i++) {   /* the confirmed timeline's value of each key, in the pass's order */
         const PresSpec *sp = pres_spec(P->last[i].slot);
-        if (sp && sp->key) { PresKey *q = pres_key_get(g_pres_conf, pres_key(&P->last[i]), 1); q->f = f; memcpy(q->pay, P->last[i].pay, PRES_PAY); }
+        if (sp && sp->key) { PresKey *q = pres_key_get(g_pres_conf, pres_key(&P->last[i]), 1); q->f = f; q->r8 = P->last[i].r8; q->r9 = P->last[i].r9; memcpy(q->pay, P->last[i].pay, PRES_PAY); }
     }
     for (int j = 0; j < P->nd; j++) {
         if (used[j] == 1) continue;   /* review fix M1: a moved +0x128 (used 2) stays an orphan by content (UE shows it at the guess's position) */
+        const PresSpec *sd = pres_spec(P->dlv[j].slot);
+        if (sd && pres_is_watch(P->dlv[j].slot)) continue;   /* v0.35.0: the watched stops are not counted (no delivery slot; v0.36.0: + +0x040) */
         g_pres_orph++;
+        if (sd && sd->nearw && !used[j]) orw_push(f, P->dlv[j].slot, P->dlv[j].idh);   /* v0.35.0: a later frame's near window may credit it */
         if (!P->dlv[j].has_key || !g_pres_repair) continue;
         int in_final = 0;
         for (int i = 0; i < P->nl && !in_final; i++) { const PresSpec *sp = pres_spec(P->last[i].slot); if (sp && sp->key && pres_key(&P->last[i]) == P->dlv[j].key) in_final = 1; }
@@ -626,12 +1089,13 @@ static void pres_confirm(uint32_t f, uint32_t s, Pend *p) {
         PresKey *q = pres_key_get(g_pres_conf, P->dlv[j].key, 0);
         if (!q) { g_pres_unrep++; continue; }   /* no confirmed value of this key yet this battle: nothing to send back */
         if (!memcmp(q->pay, u->pay, PRES_PAY)) continue;   /* UE already holds the confirmed value */
-        if (g_npresq == PRESQ_N) pres_flush();
-        g_presq_slot[g_npresq] = P->dlv[j].slot; memcpy(g_presq_pay[g_npresq], q->pay, PRES_PAY); g_npresq++;
-        g_pres_rep++; memcpy(u->pay, q->pay, PRES_PAY);
+        pres_enq(P->dlv[j].slot, q->pay, q->r8, q->r9);   /* v0.35.0: + the stored call's r8 / r9 */
+        g_pres_rep++; memcpy(u->pay, q->pay, PRES_PAY); u->r8 = q->r8; u->r9 = q->r9;
+        tr_pres(f, P->dlv[j].slot, "repair", q->pay, q->r8, q->r9);
     }
     /* the counterfactual (information): a delivery delay of N frames would have handed UE frame f's latest pass at step f + N (when f was still
-     * unconfirmed then) instead of its live pass; the calls of that pass the confirmed pass does not have are the orphans of delay N */
+     * unconfirmed then) instead of its live pass; the calls of that pass the confirmed pass does not have are the orphans of delay N (v0.35.0: the
+     * history holds no +0x010) */
     for (int N = 0; N <= 8; N++) {
         if (s <= f + (uint32_t)N) continue;   /* confirmed by then: delay N delivers the confirmed pass (no orphan) */
         int hi = -1; for (int k = 0; k < P->nh; k++) if (P->hist[k].s <= f + (uint32_t)N) hi = k;
@@ -649,15 +1113,21 @@ static void pres_reset(void) {
     memset(g_pres_cf, 0, sizeof g_pres_cf); g_pres_lat_sum = 0; memset(g_pres_lat_hist, 0, sizeof g_pres_lat_hist); g_pres_lat_max = 0;
     g_pres_us = g_pres_us_max = 0; g_npresq = 0;
     memset(g_pres_ue, 0, sizeof g_pres_ue); memset(g_pres_conf, 0, sizeof g_pres_conf);
+    memset(g_pres2, 0, sizeof g_pres2);   /* v0.35.0 (review fix M1: the own-stop counters are in g_pres2, per start slot) */
+    memset(g_pres_own, 0, sizeof g_pres_own); g_pres_norw = 0;
+    memset(g_mir, 0, sizeof g_mir); g_mir_n = 0; g_mir_full = g_mir_inj = g_mir_injfail = g_mir_untrk = g_mir_lost = 0; memset(g_mir_utr, 0, sizeof g_mir_utr);   /* v0.36.0 */
+    g_mir_injlines = 0; memset(g_fxm, 0, sizeof g_fxm);
 }
 static void pres_slots_str(uint64_t m, char *out, size_t cap) {
     size_t o = 0; out[0] = 0;
     for (int i = 1; i < LISTENER_NSLOTS; i++) if ((m >> i) & 1) { int k = snprintf(out + o, cap - o, "%s0x%03x", o ? "," : "", i * 8); if (k > 0 && (size_t)k < cap - o) o += (size_t)k; }
     if (!o) snprintf(out, cap, "none");
 }
-/* rb_cfg_check: rb_pres_slots / rb_pres_repair (presentation keys: outside every hash; a bad value is clamped and said so, never refused) */
+/* rb_cfg_check: rb_pres_slots / rb_pres_repair (presentation keys: outside every hash; a bad value is clamped and said so, never refused). v0.35.0: + 0x008,
+ * 0x028; 0x010 is the internal watch slot (recorded while 0x008 is on, CLAMPED from the ini). v0.36.0: + 0x038 (the voice; its watch slot 0x040 is recorded
+ * while it is on, CLAMPED from the ini like 0x010 / 0x030); the default is unchanged */
 static void pres_cfg(void) {
-    char b[160]; cfg_gets("rb_pres_slots", "0x120,0x128", b, sizeof b);
+    char b[160]; cfg_gets("rb_pres_slots", PRES_DEFAULT_SLOTS, b, sizeof b);
     uint64_t m = 0; int bad = 0;
     if (_stricmp(b, "none") && strcmp(b, "0")) {
         const char *q = b;
@@ -672,17 +1142,50 @@ static void pres_cfg(void) {
         }
     }
     m &= ~g_cfg.rb_state_mask;   /* the state class keeps its own delivery (RPB / resim_confirmed) */
-    g_pres_mask = m;
     g_pres_repair = cfg_geti("rb_pres_repair", 1) != 0;
 #ifdef SC6RB_HARNESS
     g_pres_nol4 = cfg_geti("h_rb_pres_nol4", 0);
     g_pres_128old = cfg_geti("h_rb_pres_128old", 0);
     g_pres_128noid = cfg_geti("h_rb_pres_128noid", 0);
+    g_pres_noregs = cfg_geti("h_rb_pres_noregs", 0); g_pres_pay30 = cfg_geti("h_rb_pres_pay30", 0); g_pres_nonear = cfg_geti("h_rb_pres_nonear", 0);   /* v0.35.0 */
+    g_pres_regid = cfg_geti("h_rb_pres_regid", 0); g_pres_nostopg = cfg_geti("h_rb_pres_nostopg", 0); g_pres_noown = cfg_geti("h_rb_pres_noown", 0);
+    g_pres_snd1shot = cfg_geti("h_rb_pres_snd1shot", 0);   /* review fix M1 */
+    g_pres_mir_off = cfg_geti("h_rb_pres_mir_off", 0); g_pres_noinj = cfg_geti("h_rb_pres_noinj", 0); g_pres_nosync = cfg_geti("h_rb_pres_nosync", 0);   /* v0.36.0 */
+    g_pres_nonewer = cfg_geti("h_rb_pres_nonewer", 0); g_pres_nostoplive = cfg_geti("h_rb_pres_nostoplive", 0); g_pres_noexpand = cfg_geti("h_rb_pres_noexpand", 0);
+    g_pres_noforce = cfg_geti("h_rb_pres_noforce", 0); g_pres_fxlive = cfg_geti("h_rb_pres_fxlive", 0); g_pres_nosupv = cfg_geti("h_rb_pres_nosupv", 0);
 #endif
-    char sl[96]; pres_slots_str(m, sl, sizeof sl);
-    LOG("CFG RBPRES slots=%s repair=%d%s%s (v0.33.0: the missed presentation notifications are delivered once from the confirmed pass; outside every hash)\n", sl, g_pres_repair,
-        bad ? " CLAMPED(ini value has a slot without a verified payload layout: only 0x120 and 0x128 are accepted)" : "", RBT(g_pres_nol4) ? " h_rb_pres_nol4=1(harness control XFXW: no L4 guard)" : "");
+    /* v0.35.0: the watch slots. Review fix M1: every start slot's stop slot is watched (+0x010 while 0x008 is on, +0x030 while 0x028 is on); a start slot whose
+     * stop slot is the state class (rb_state_slots) could never be guarded, so it is not delivered late (CLAMPED). v0.36.0: the voice like a start (+0x040 while
+     * 0x038 is on) */
+    uint64_t w = 0; int nostop = 0, nostopv = 0;
+    for (size_t i = 0; i < sizeof k_pres_spec / sizeof k_pres_spec[0]; i++) {
+        const PresSpec *sp = &k_pres_spec[i];
+        if ((pres_cls(sp) != PC_START && sp->cls != PC_VOICE) || !((m >> sp->slot) & 1)) continue;
+        if ((g_cfg.rb_state_mask >> sp->mate) & 1) { m &= ~(1ULL << sp->slot); if (sp->cls == PC_VOICE) nostopv = 1; else nostop = 1; continue; }
+        w |= 1ULL << sp->mate;
+    }
+    g_pres_mask = m; g_pres_watch = w;
+    char sl[96], wl[48]; pres_slots_str(m, sl, sizeof sl); pres_slots_str(w, wl, sizeof wl);
+    /* v0.36.0: the mirror / voice fields only when 0x028 or 0x038 is on (every other configuration's line is v0.35.0's, byte for byte) */
+    char mv[200] = "";
+    if (((m >> (0x028 / 8)) & 1) || ((m >> (0x038 / 8)) & 1))
+        snprintf(mv, sizeof mv, " sndmirror=%s mir_n=%d voice=%s (v0.36.0: late sound stops on a mirror of UE's latest-only sound tracking; the voice +0x038 late)",
+                 mir_on() ? "on" : "off", MIR_N, (m >> (0x038 / 8)) & 1 ? "on" : "off");
+    LOG("CFG RBPRES slots=%s repair=%d watch=%s near_w=%d%s%s%s%s%s (v0.33.0: the missed presentation notifications are delivered once from the confirmed pass; v0.35.0: + +0x008 / "
+        "+0x028 with r8 / r9, the near window, the stop guard and the own stop (+0x008 by its +0x010 stops, +0x028 by its +0x030 stops); outside every hash)\n", sl, g_pres_repair, wl,
+        PRES_NEAR_W, mv, bad ? " CLAMPED(ini value has a slot without a verified payload layout: only 0x008, 0x028, 0x038, 0x120 and 0x128 are accepted)" : "",
+        nostop ? " CLAMPED(the stop slot of 0x008 / 0x028 is in rb_state_slots: that start slot is not delivered late)" : "",
+        nostopv ? " CLAMPED(the voice's stop slot 0x040 is in rb_state_slots: 0x038 is not delivered late)" : "", RBT(g_pres_nol4) ? " h_rb_pres_nol4=1(harness control XFXW: no L4 guard)" : "");
     if (RBT(g_pres_128old) || RBT(g_pres_128noid)) LOG("CFG RBPRES harness control: rule128=%s\n", pres_rule128());
+#ifdef SC6RB_HARNESS
+    if (g_pres_noregs || g_pres_pay30 || g_pres_nonear || g_pres_regid || g_pres_nostopg || g_pres_noown || g_pres_snd1shot || g_pres_mir_off || g_pres_noinj || g_pres_nosync ||
+        g_pres_nonewer || g_pres_nostoplive || g_pres_noexpand || g_pres_noforce || g_pres_fxlive || g_pres_nosupv)
+        LOG("CFG RBPRES harness control:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n", g_pres_noregs ? " h_rb_pres_noregs=1" : "", g_pres_pay30 ? " h_rb_pres_pay30=1" : "", g_pres_nonear ? " h_rb_pres_nonear=1" : "",
+            g_pres_regid ? " h_rb_pres_regid=1" : "", g_pres_nostopg ? " h_rb_pres_nostopg=1" : "", g_pres_noown ? " h_rb_pres_noown=1" : "",
+            g_pres_snd1shot ? " h_rb_pres_snd1shot=1" : "", g_pres_mir_off ? " h_rb_pres_mir_off=1" : "", g_pres_noinj ? " h_rb_pres_noinj=1" : "", g_pres_nosync ? " h_rb_pres_nosync=1" : "",
+            g_pres_nonewer ? " h_rb_pres_nonewer=1" : "", g_pres_nostoplive ? " h_rb_pres_nostoplive=1" : "", g_pres_noexpand ? " h_rb_pres_noexpand=1" : "",
+            g_pres_noforce ? " h_rb_pres_noforce=1" : "", g_pres_fxlive ? " h_rb_pres_fxlive=1" : "", g_pres_nosupv ? " h_rb_pres_nosupv=1" : "");
+#endif
 }
 static void pres_report(void) {
     if (!g_pres_mask) return;
@@ -703,19 +1206,207 @@ static void pres_report(void) {
     if ((g_pres_mask >> (0x128 / 8)) & 1)
         LOG("RBPRES128 b=%llu rule=%s late=%llu moved=%llu withheld=%llu dbl_frames=%llu cm_frames=%llu\n", (unsigned long long)g_bat, pres_rule128(),
             (unsigned long long)g_pres_l128, (unsigned long long)g_pres_moved, (unsigned long long)g_pres_held, (unsigned long long)g_pres_dbl, (unsigned long long)g_pres_cm);
+    /* v0.35.0 (OPTA-M2-SPEC.md §25): one line per enabled new slot. late / moved / held / near / stopped = the per-call decisions (k=L why=); ownstop = the
+     * missed +0x010 stops delivered late for effects this plugin started late or credited near, ownheld = such stops held back (UE got a newer start of the
+     * key), stop_notown = missed stops of effects UE got live (left alone, v0.34.2); own_open = own entries still open at the battle end, own_over = entries
+     * evicted from the full table; cm_frames / dbl_frames as RBPRES128's; noregs = calls whose r8 / r9 could not be read (+0x008's line: + its +0x010).
+     * Review fix M1: the +0x028 line keeps its v0.35.0 fields in order and appends the stop fields of the sound (stopped by a +0x030 UE already got, the
+     * +0x030 own stops, ownheld, stop_notown, own_open, own_over); its noregs adds the +0x030 calls' */
+    if ((g_pres_mask >> (0x008 / 8)) & 1) {
+        const uint64_t *c = g_pres2[0x008 / 8];
+        LOG("RBPRES2 b=%llu slot=+0x008 late=%llu moved=%llu held=%llu near=%llu stopped=%llu ownstop=%llu ownheld=%llu stop_notown=%llu own_open=%d own_over=%llu cm_frames=%llu "
+            "dbl_frames=%llu noregs=%llu\n", (unsigned long long)g_bat, (unsigned long long)c[P2_LATE], (unsigned long long)c[P2_MOVED], (unsigned long long)c[P2_HELD],
+            (unsigned long long)c[P2_NEAR], (unsigned long long)c[P2_STOPPED], (unsigned long long)c[P2_OWNSTOP], (unsigned long long)c[P2_OWNHELD],
+            (unsigned long long)c[P2_NOTOWN], own_nopen(0x008 / 8), (unsigned long long)c[P2_OWNOVER], (unsigned long long)c[P2_CM], (unsigned long long)c[P2_DBL],
+            (unsigned long long)(c[P2_NOREGS] + g_pres2[PRES_WATCH_SLOT][P2_NOREGS]));
+    }
+    /* v0.36.0 (OPTA-M2-SPEC.md §26): the +0x028 line appends the mirror's fields: newer (late starts not sent: UE tracks a newer playback), sync (stops sent before a
+     * late start), stoplive (missed stops of live-started sounds delivered; a subset of ownstop, which now counts every missed +0x030 delivered), inject (stops made
+     * inside a live pass before a forwarded start), unmir (late starts of an unmirrored key: not sent), mir_full (keys the table refused), expand (id stops of a held
+     * stop-all), sallforce (stop-alls the timeline's untrackings sent past a newer start), mirlost (sound calls whose key was unreadable: the mirror off for the
+     * battle), untrk (own late playbacks a live start untracked: a failed or disabled injection). While the mirror is on, own_open = its late playbacks that may
+     * still play. untrk / mirlost / mir_full are 0 in every run but a control */
+    if ((g_pres_mask >> (0x028 / 8)) & 1) {
+        const uint64_t *c = g_pres2[0x028 / 8];
+        LOG("RBPRES2 b=%llu slot=+0x028 late=%llu moved=%llu held=%llu near=%llu cm_frames=%llu dbl_frames=%llu noregs=%llu stopped=%llu ownstop=%llu ownheld=%llu stop_notown=%llu "
+            "own_open=%d own_over=%llu newer=%llu sync=%llu stoplive=%llu inject=%llu unmir=%llu mir_full=%llu expand=%llu sallforce=%llu mirlost=%llu untrk=%llu\n", (unsigned long long)g_bat,
+            (unsigned long long)c[P2_LATE], (unsigned long long)c[P2_MOVED], (unsigned long long)c[P2_HELD], (unsigned long long)c[P2_NEAR], (unsigned long long)c[P2_CM],
+            (unsigned long long)c[P2_DBL], (unsigned long long)(c[P2_NOREGS] + g_pres2[0x030 / 8][P2_NOREGS]), (unsigned long long)c[P2_STOPPED], (unsigned long long)c[P2_OWNSTOP],
+            (unsigned long long)c[P2_OWNHELD], (unsigned long long)c[P2_NOTOWN], mir_on() ? mir_nown() : own_nopen(0x028 / 8), (unsigned long long)c[P2_OWNOVER],
+            (unsigned long long)c[P2_NEWER], (unsigned long long)c[P2_SYNC], (unsigned long long)c[P2_STOPLIVE], (unsigned long long)g_mir_inj, (unsigned long long)c[P2_MIROUT],
+            (unsigned long long)g_mir_full, (unsigned long long)c[P2_EXPAND], (unsigned long long)c[P2_FORCE], (unsigned long long)g_mir_lost, (unsigned long long)g_mir_untrk);
+    }
+    /* v0.36.0: the voice. late / moved / held / near / stopped (a real +0x040 of the owner reached UE) / sup (UE already got a newer voice of the owner) = the
+     * per-call decisions; noregs = +0x038's and +0x040's */
+    if ((g_pres_mask >> (0x038 / 8)) & 1) {
+        const uint64_t *c = g_pres2[0x038 / 8];
+        LOG("RBPRES2 b=%llu slot=+0x038 late=%llu moved=%llu held=%llu near=%llu stopped=%llu sup=%llu cm_frames=%llu dbl_frames=%llu noregs=%llu\n", (unsigned long long)g_bat,
+            (unsigned long long)c[P2_LATE], (unsigned long long)c[P2_MOVED], (unsigned long long)c[P2_HELD], (unsigned long long)c[P2_NEAR], (unsigned long long)c[P2_STOPPED],
+            (unsigned long long)c[P2_SUP], (unsigned long long)c[P2_CM], (unsigned long long)c[P2_DBL], (unsigned long long)(c[P2_NOREGS] + g_pres2[0x040 / 8][P2_NOREGS]));
+    }
+}
+
+/* ------------------------------------------------------------------ v0.34.2 (the spark test, OPTA-M2-SPEC.md §24): the listener-call trace */
+static uint64_t g_tr_mask;           /* rb_lsn_trace (default none): the traced listener slots (never a query, never the state class) */
+static uint64_t g_tr_lines_max = 60000, g_tr_lines, g_tr_drop, g_tr_over, g_tr_nopay, g_tr_noregs, g_tr_kl;   /* per battle (step thread only) */
+#ifdef SC6RB_HARNESS
+static int g_tr_skipd;               /* harness-only control (h_rb_lsn_trace_skipd=1, XGLT): the k=D lines are not written (RBT: 0 in the plugin) */
+static int g_tr_maxc = TR_MAXC;      /* harness-only (h_rb_lsn_trace_maxc, GLTO): a smaller per-pass / per-frame call buffer, to drive the overflow path */
+#define TR_CAP g_tr_maxc
+#else
+#define TR_CAP TR_MAXC
+#endif
+/* review fix MAJOR-2: pres_confirm's decisions for the frame being confirmed (late / sup / held / moved / repair), written as k=L lines by tr_confirm
+ * right after (confirm_frame calls the two in that order for the same frame). Late and repaired calls reach UE from pres_flush, not through the
+ * listener hook, so they have no k=D line: without k=L a late +0x120 / +0x128 would read as missed. v0.35.0: + the confirmed call's r8 / r9 (a repair:
+ * the stored call's) and the decisions near / stopped / ownstop / ownheld (each <= 7 characters). v0.36.0: why 8 -> 12 characters (+ newer / sync / stoplive /
+ * expand / sallforce / unmir at +0x028 / +0x030, sup at +0x038; "sallforce" has 9) */
+#define TR_MAXL 32
+static struct { uint32_t f; uint8_t slot; char why[12]; uint64_t r8, r9; uint8_t pay[TR_PAY]; } g_trl[TR_MAXL];
+static int g_trl_n, g_trl_over;
+static void tr_pres(uint32_t f, int slot, const char *why, const uint8_t *pay, uint64_t r8, uint64_t r9) {
+    if (!((g_tr_mask >> slot) & 1)) return;
+    if (g_trl_n >= TR_MAXL || g_trl_n >= TR_CAP) { g_trl_over++; return; }
+    g_trl[g_trl_n].f = f; g_trl[g_trl_n].slot = (uint8_t)slot; snprintf(g_trl[g_trl_n].why, sizeof g_trl[0].why, "%s", why);
+    g_trl[g_trl_n].r8 = r8; g_trl[g_trl_n].r9 = r9;
+    memcpy(g_trl[g_trl_n].pay, pay, TR_PAY); g_trl_n++;
+}
+/* a call of a traced slot inside a recorded pass (step thread): rdx and, when it points into the step thread's stack, the raw bytes there; r8 / r9 */
+static void tr_note(int slot, uint64_t rdx, uint64_t crsp, int fwd) {
+    if (g_pass.tn >= TR_CAP) { g_pass.tover++; return; }
+    TrCall *c = &g_pass.tc[g_pass.tn++];
+    memset(c, 0, sizeof *c); c->slot = (uint8_t)slot; c->fwd = (uint8_t)(fwd != 0); c->s = g_pass.s; c->rdx = rdx;
+    NT_TIB *tib = (NT_TIB *)NtCurrentTeb();   /* only a local of the step's stack is read (rdx may be a value, not a pointer) */
+    uint64_t lo = (uint64_t)(uintptr_t)tib->StackLimit, hi = (uint64_t)(uintptr_t)tib->StackBase;
+    if (rdx >= lo && rdx <= hi && hi - rdx >= TR_PAY) { memcpy(c->pay, (const void *)(uintptr_t)rdx, TR_PAY); c->inst = 1; }   /* review fix MAJOR-1: no wrap */
+    else g_tr_nopay++;
+    /* review fix MINOR-8: the call's r8 / r9 = the forwarding thunk's saved copies (src/fwd_thunks.S: [rbp-0x30] / [rbp-0x38], crsp = rbp + 0x10) */
+    if (crsp >= lo + 0x48 && crsp <= hi) { memcpy(&c->r8, (const void *)(uintptr_t)(crsp - 0x40), 8); memcpy(&c->r9, (const void *)(uintptr_t)(crsp - 0x48), 8); c->regs = 1; }
+    else g_tr_noregs++;
+}
+/* after a recorded (non-RPB) pass of the frame: its calls become the frame's last calls; the ones it forwarded join the frame's delivered set */
+static void tr_record(Pend *p) {
+    if (!g_tr_mask) return;
+    TrFrame *T = &p->tr;
+    T->nl = g_pass.tn; memcpy(T->last, g_pass.tc, sizeof(TrCall) * (size_t)g_pass.tn);
+    T->over += g_pass.tover; g_tr_over += (uint64_t)g_pass.tover;
+    for (int i = 0; i < g_pass.tn; i++) {
+        if (!g_pass.tc[i].fwd) continue;
+        if (T->nd < TR_CAP) T->dlv[T->nd++] = g_pass.tc[i]; else { T->over++; g_tr_over++; }
+    }
+}
+static void tr_hex(char *o, const uint8_t *b) { for (int j = 0; j < TR_PAY; j++) snprintf(o + 2 * j, 3, "%02x", b[j]); }
+static void tr_line(uint32_t f, uint32_t s, const Pend *p, char kind, const TrCall *c, int i, int n) {
+    char pay[TR_PAY * 2 + 1], rg[48];
+    if (c->inst) tr_hex(pay, c->pay); else snprintf(pay, sizeof pay, "-");
+    if (c->regs) snprintf(rg, sizeof rg, "r8=%016llx r9=%016llx", (unsigned long long)c->r8, (unsigned long long)c->r9); else snprintf(rg, sizeof rg, "r8=- r9=-");
+    LOG("RBLSNTR b=%llu f=%u slot=+0x%03x k=%c i=%d n=%d fwd=%d pass_s=%u lt=%u ps=%c z=%d tail=%d rdx=%016llx %s pay=%s\n", (unsigned long long)g_bat, f, c->slot * 8,
+        kind, i, n, c->fwd, c->s, s >= f ? s - f : 0, p->ps, zone_of(f), g_in_tail, (unsigned long long)c->rdx, rg, pay);
+}
+/* frame f is confirmed at step s: per traced slot, the confirmed pass's calls (k=F), every call UE got through the listener for the frame (k=D) and
+ * pres_confirm's decisions (k=L: late = UE gets it now, from the confirmed pass; repair = UE gets the confirmed value back; sup / held / moved = not
+ * sent: UE holds a newer value / already showed as many +0x128 effects / showed it at the guess's position); then RBLSNTROVER when calls of the frame
+ * were not kept (review fix MINOR-1). The line cap takes whole frames (review MINOR-7): once a frame does not fit, it and every later frame are
+ * counted in dropped=, so every written frame is complete. */
+static void tr_confirm(uint32_t f, uint32_t s, const Pend *p) {
+    const TrFrame *T = &p->tr;
+    int nl = 0, stale = 0;
+    for (int k = 0; k < g_trl_n; k++) { if (g_trl[k].f == f) nl++; else stale++; }   /* stale: never expected (pres_confirm runs just before for f) */
+    int over = T->over + g_trl_over + stale;
+    g_tr_over += (uint64_t)(g_trl_over + stale);
+    uint64_t tot = (uint64_t)T->nl + (RBT(g_tr_skipd) ? 0 : (uint64_t)T->nd) + (uint64_t)nl + (over ? 1 : 0);
+    if (g_tr_drop || g_tr_lines + tot > g_tr_lines_max) {
+        if (tot && !g_tr_drop) LOG("RBLSNTR cap reached b=%llu f=%u (rb_lsn_trace_lines=%llu): this and later frames are counted in RBLSNTRSUM dropped=, not written\n",
+                                   (unsigned long long)g_bat, f, (unsigned long long)g_tr_lines_max);
+        g_tr_drop += tot;
+        g_trl_n = g_trl_over = 0;
+        return;
+    }
+    g_tr_lines += tot;
+    for (int slot = 1; slot < LISTENER_NSLOTS; slot++) {
+        if (!((g_tr_mask >> slot) & 1)) continue;
+        int nf = 0, nd = 0, ns = 0, a;
+        for (int i = 0; i < T->nl; i++) nf += T->last[i].slot == slot;
+        for (int j = 0; j < T->nd; j++) nd += T->dlv[j].slot == slot;
+        for (int k = 0; k < g_trl_n; k++) ns += g_trl[k].f == f && g_trl[k].slot == slot;
+        a = 0; for (int i = 0; i < T->nl; i++) if (T->last[i].slot == slot) tr_line(f, s, p, 'F', &T->last[i], a++, nf);
+        if (!RBT(g_tr_skipd)) { a = 0; for (int j = 0; j < T->nd; j++) if (T->dlv[j].slot == slot) tr_line(f, s, p, 'D', &T->dlv[j], a++, nd); }
+        a = 0;
+        for (int k = 0; k < g_trl_n; k++) {
+            if (g_trl[k].f != f || g_trl[k].slot != slot) continue;
+            char pay[TR_PAY * 2 + 1]; tr_hex(pay, g_trl[k].pay);
+            LOG("RBLSNTR b=%llu f=%u slot=+0x%03x k=L i=%d n=%d why=%s lt=%u ps=%c z=%d tail=%d r8=%016llx r9=%016llx pay=%s\n", (unsigned long long)g_bat, f, slot * 8, a++, ns,
+                g_trl[k].why, s >= f ? s - f : 0, p->ps, zone_of(f), g_in_tail, (unsigned long long)g_trl[k].r8, (unsigned long long)g_trl[k].r9, pay);   /* v0.35.0: + r8 / r9 */
+            g_tr_kl++;
+        }
+    }
+    if (over) LOG("RBLSNTROVER b=%llu f=%u over=%d (calls of this frame past the trace buffer: not written; lt=%u)\n", (unsigned long long)g_bat, f, over, s >= f ? s - f : 0);
+    g_trl_n = g_trl_over = 0;
+}
+static void tr_reset(void) { g_tr_lines = g_tr_drop = g_tr_over = g_tr_nopay = g_tr_noregs = g_tr_kl = 0; g_trl_n = g_trl_over = 0; }
+/* rb_cfg_check: rb_lsn_trace = hex slot offsets ("0x010,0x0a0"), "all" or "none" (the default) and rb_lsn_trace_lines (the per-battle line cap, default 60000). Any
+ * listener slot but the two queries and the state class (whose calls have their own RBSTATEEV lines); a bad entry is dropped and said so, never
+ * refused. Read with cfg_gets / cfg_geti: outside every setup / simcfg / rbcfg hash, so a trace run replays and pairs exactly like one without. */
+static void tr_cfg(void) {
+    char b[512]; cfg_gets("rb_lsn_trace", "none", b, sizeof b);
+    uint64_t m = 0; int bad = 0;
+    if (!_stricmp(b, "all")) {   /* every slot but the two queries (the state class is dropped below, silently for "all") */
+        for (int i = 1; i < LISTENER_NSLOTS; i++) if (!is_query(i)) m |= 1ULL << i;
+        m &= ~g_cfg.rb_state_mask;
+    } else if (_stricmp(b, "none") && strcmp(b, "0")) {
+        const char *q = b;
+        while (*q) {
+            while (*q == ' ' || *q == ',' || *q == '+') q++;
+            if (!*q) break;
+            char *e; unsigned long v = strtoul(q, &e, 16);
+            if (e == q) { bad = 1; break; }
+            q = e;
+            if (v % 8 || v / 8 == 0 || v / 8 >= LISTENER_NSLOTS || is_query((int)(v / 8))) { bad = 1; continue; }
+            m |= 1ULL << (v / 8);
+        }
+    }
+    if (m & g_cfg.rb_state_mask) bad = 1;
+    m &= ~g_cfg.rb_state_mask;
+    g_tr_mask = m;
+    int lm = cfg_geti("rb_lsn_trace_lines", 60000); g_tr_lines_max = lm < 0 ? 0 : (uint64_t)lm;
+#ifdef SC6RB_HARNESS
+    g_tr_skipd = cfg_geti("h_rb_lsn_trace_skipd", 0);
+    { int mc = cfg_geti("h_rb_lsn_trace_maxc", TR_MAXC); g_tr_maxc = mc < 1 ? 1 : mc > TR_MAXC ? TR_MAXC : mc; }
+#endif
+    if (!m && !bad) return;   /* the default: no line (every existing ini's log is unchanged) */
+    char sl[512]; pres_slots_str(m, sl, sizeof sl);
+    LOG("CFG RBLSNTR slots=%s lines_max=%llu%s%s (v0.34.2 the spark test: one line per call of these listener slots at each frame's confirmation; logging only, outside every hash)\n",
+        sl, (unsigned long long)g_tr_lines_max, bad ? " CLAMPED(a slot that is not a multiple of 8 in 0x008..0x140, a query or the state class was dropped)" : "",
+        RBT(g_tr_skipd) ? " h_rb_lsn_trace_skipd=1(harness control XGLT: no k=D lines)" : "");
+#ifdef SC6RB_HARNESS
+    if (g_tr_maxc != TR_MAXC) LOG("CFG RBLSNTR h_rb_lsn_trace_maxc=%d (harness only: the call buffer, GLTO)\n", g_tr_maxc);
+#endif
+}
+static void tr_report(void) {
+    if (!g_tr_mask) return;
+    char sl[512]; pres_slots_str(g_tr_mask, sl, sizeof sl);
+    LOG("RBLSNTRSUM b=%llu slots=%s lines=%llu dropped=%llu over=%llu nopay=%llu noregs=%llu kl=%llu (k=F: the confirmed pass's calls; k=D: the calls UE got through the listener, "
+        "any pass; k=L: the late / repair / sup / held / moved decisions; nopay: rdx not in the step's stack; noregs: r8 / r9 not read)\n",
+        (unsigned long long)g_bat, sl, (unsigned long long)g_tr_lines, (unsigned long long)g_tr_drop, (unsigned long long)g_tr_over, (unsigned long long)g_tr_nopay,
+        (unsigned long long)g_tr_noregs, (unsigned long long)g_tr_kl);
 }
 
 /* ------------------------------------------------------------------ the listener hook (modes.c lsn_pre, step thread, inside a pass) */
 void rb_straight_mark(uint32_t f) {
     if (f) { memset(&g_pass, 0, sizeof g_pass); g_pass.type = PT_STRAIGHT; g_pass.k = f; g_pass.s = f; } else g_pass.type = PT_NONE;
 }
-int rb_lsn_pre(int slot, uint64_t rdx) {
+int rb_lsn_pre(int slot, uint64_t rdx, uint64_t crsp) {
     if (!g_pass.type || slot <= 0 || slot >= LISTENER_NSLOTS || is_query(slot)) return 0;
     if (GetCurrentThreadId() != g_step_tid && g_pass.type != PT_STRAIGHT) return 0;
     g_pass.calls[slot]++;
     int st = (int)((g_cfg.rb_state_mask >> slot) & 1);
     int fwd_fn = lp_family.fn[slot] != NULL;
-    if (((g_pres_mask >> slot) & 1) && g_pass.type != PT_STRAIGHT && g_pass.type != PT_RPB) pres_note(slot, rdx, fwd_fn);   /* v0.33.0 (§22.1) */
+    int pi = -1;
+    if ((((g_pres_mask | g_pres_watch) >> slot) & 1) && g_pass.type != PT_STRAIGHT && g_pass.type != PT_RPB) pi = pres_note(slot, rdx, crsp, fwd_fn);   /* v0.33.0 (§22.1);
+                                                                                                         * v0.35.0: + the +0x010 watch, crsp (r8 / r9) */
+    if (fwd_fn && (slot == 0x028 / 8 || slot == 0x030 / 8) && mir_on()) snd_fwd(slot, rdx, pi);   /* v0.36.0: the sound mirror, every forwarding pass type (§26) */
+    if (fwd_fn && (slot == 0x008 / 8 || slot == 0x010 / 8) && RBT(g_pres_fxlive)) fx_fwd(slot, rdx);   /* v0.36.0: the +0x010 switch (harness only) */
+    if (((g_tr_mask >> slot) & 1) && g_pass.type != PT_STRAIGHT && g_pass.type != PT_RPB) tr_note(slot, rdx, crsp, fwd_fn);   /* v0.34.2: the trace (never the state class) */
     if (!st) { if (fwd_fn) { g_pass.fwd[slot]++; g_step_fwd++; } return 0; }
     const char *pn = NULL;
     switch (g_pass.type) {
@@ -862,6 +1553,7 @@ static void pass_record(uint32_t k, const FrameIn *in, char ps) {
     memcpy(p->calls, g_pass.calls, sizeof p->calls);
     for (int i = 0; i < LISTENER_NSLOTS; i++) p->fwd[i] = (uint16_t)(p->fwd[i] + g_pass.fwd[i]);
     pres_record(p, k);   /* v0.33.0 (§22.1) */
+    tr_record(p);        /* v0.34.2: the listener-call trace */
     c1a_pass_compute(k, &p->used, p->ifc, p->q, &p->pass, &g_diag);
     g_pass.type = PT_NONE;
 }
@@ -1138,13 +1830,16 @@ static void confirm_frame(uint32_t f, uint32_t s) {
     { uint8_t b8[8]; uint64_t t = p->pass.fr.t1; for (int i = 0; i < 8; i++) b8[i] = (uint8_t)(t >> (8 * i)); g_chain = emu_fnv1a(b8, 8, g_chain); }
     if (g_pres_mask) {   /* v0.33.0 (§22.1): the missed presentation calls of the confirmed pass, once (a flushed tail is not delivered: counted) */
         if (!g_in_tail) pres_confirm(f, s, p);
-        else { PresFrame *P = &p->pres; uint8_t u[PRES_MAXD]; memset(u, 0, sizeof u);
-               for (int i = 0; i < P->nl; i++) { int m = 0; for (int j = 0; j < P->nd; j++) if (!u[j] && P->dlv[j].h == P->last[i].h) { u[j] = 1; m = 1; break; } if (!m) g_pres_tail++; } }
+        else { PresFrame *P = &p->pres; uint8_t u[PRES_MAXD]; memset(u, 0, sizeof u);   /* v0.35.0: every delivery slot but the watched stops (+0x010, review fix M1: +0x030) */
+               for (int i = 0; i < P->nl; i++) { if (pres_is_watch(P->last[i].slot)) continue;
+                                                 int m = 0; for (int j = 0; j < P->nd; j++) if (!u[j] && P->dlv[j].h == P->last[i].h) { u[j] = 1; m = 1; break; } if (!m) g_pres_tail++; } }
     }
+    if (g_tr_mask) tr_confirm(f, s, p);   /* v0.34.2: the listener-call trace (a flushed tail too: tail=1) */
     for (int i = 1; i < LISTENER_NSLOTS; i++) {
         if (is_query(i)) continue;
-        uint64_t fw = (uint64_t)p->fwd[i] + p->pres_late[i] + p->pres_sup[i], fi = p->calls[i];   /* v0.33.0: + the late deliveries and the superseded calls */
-        g_led_fwd[i] += fw; g_led_final[i] += fi; g_led_late[i] += p->pres_late[i]; g_led_sup[i] += p->pres_sup[i];
+        uint64_t fw = (uint64_t)p->fwd[i] + p->pres_late[i] + p->pres_sup[i] + p->pres_near[i], fi = p->calls[i];   /* v0.33.0: + the late deliveries and the superseded calls;
+                                                                                                                  * v0.35.0: + the near-window credits */
+        g_led_fwd[i] += fw; g_led_final[i] += fi; g_led_late[i] += p->pres_late[i]; g_led_sup[i] += p->pres_sup[i]; g_led_near[i] += p->pres_near[i];
         if (fw > fi) g_led_orphan[i] += fw - fi; else g_led_missed[i] += fi - fw;
     }
     if (p->pend_st) { g_statelost++; LOG("RBSTATELOST f=%u slot=+0x%03x cause=%s\n", f, p->pend_slot * 8, g_cfg.rb_rollback ? "ring" : "control_no_rollback"); }
@@ -1212,7 +1907,13 @@ static void rb_end_lines(const char *why) {
         (unsigned long long)g_pindeny);
     for (int i = 1; i < LISTENER_NSLOTS; i++)
         if (g_led_fwd[i] || g_led_final[i]) {
-            if ((g_pres_mask >> i) & 1)   /* v0.33.0 (§22.1): fwd counts the live, late and superseded deliveries; the late ones and the superseded ones are named */
+            if ((i == 0x008 / 8 || i == 0x028 / 8 || i == 0x038 / 8) && ((g_pres_mask >> i) & 1))   /* v0.35.0 (§25): + near= (the near-window credits, counted in fwd);
+                                                                                                    * v0.36.0: + the voice */
+                LOG("RBLEDGER b=%llu slot=+0x%03x fwd=%llu final=%llu orphan=%llu missed=%llu late=%llu superseded=%llu near=%llu\n", (unsigned long long)g_bat, i * 8, (unsigned long long)g_led_fwd[i],
+                    (unsigned long long)g_led_final[i], (unsigned long long)g_led_orphan[i], (unsigned long long)g_led_missed[i], (unsigned long long)g_led_late[i], (unsigned long long)g_led_sup[i],
+                    (unsigned long long)g_led_near[i]);
+            else if (((g_pres_mask | g_pres_watch) >> i) & 1)   /* v0.33.0 (§22.1): fwd counts the live, late and superseded deliveries; the late ones and the superseded ones are
+                                                                * named (v0.35.0: + the +0x010 watch: its late = the own stops) */
                 LOG("RBLEDGER b=%llu slot=+0x%03x fwd=%llu final=%llu orphan=%llu missed=%llu late=%llu superseded=%llu\n", (unsigned long long)g_bat, i * 8, (unsigned long long)g_led_fwd[i],
                     (unsigned long long)g_led_final[i], (unsigned long long)g_led_orphan[i], (unsigned long long)g_led_missed[i], (unsigned long long)g_led_late[i], (unsigned long long)g_led_sup[i]);
             else
@@ -1220,6 +1921,7 @@ static void rb_end_lines(const char *why) {
                 (unsigned long long)g_led_final[i], (unsigned long long)g_led_orphan[i], (unsigned long long)g_led_missed[i]);
         }
     pres_report();   /* v0.33.0 (§22.1) */
+    tr_report();     /* v0.34.2 */
     log_flush();
 }
 static void tick_close(void) {
@@ -1354,7 +2056,8 @@ static void battle_reset(void) {
     g_live = g_rbk = g_dmax = g_cin = g_cst = g_cboth = g_rpb = g_refused_n = g_barriers = g_clears = g_pinq = g_pinq_bytes = 0;
     g_pinguard = g_layout = g_stateev = g_statelost = g_ueskip = g_multi_ticks = g_def_ticks = g_tail_unconf = g_tail_mm = g_confirmed = 0;
     memset(g_dhist, 0, sizeof g_dhist); g_nbc = 0;
-    memset(g_led_fwd, 0, sizeof g_led_fwd); memset(g_led_final, 0, sizeof g_led_final); memset(g_led_orphan, 0, sizeof g_led_orphan); memset(g_led_missed, 0, sizeof g_led_missed); memset(g_led_late, 0, sizeof g_led_late); memset(g_led_sup, 0, sizeof g_led_sup); pres_reset();   /* v0.33.0 */
+    memset(g_led_fwd, 0, sizeof g_led_fwd); memset(g_led_final, 0, sizeof g_led_final); memset(g_led_orphan, 0, sizeof g_led_orphan); memset(g_led_missed, 0, sizeof g_led_missed); memset(g_led_late, 0, sizeof g_led_late); memset(g_led_sup, 0, sizeof g_led_sup); pres_reset(); tr_reset();   /* v0.33.0; v0.34.2 */
+    memset(g_led_near, 0, sizeof g_led_near);   /* v0.35.0 */
     g_lines_clamp = g_lines_pinq = g_lines_tick = 0;
     g_c0_mid = 0; g_c0_late_max = 0;   /* C1B3: */
     for (int b = 0; b < NBK; b++) g_bk_n[b] = 0;

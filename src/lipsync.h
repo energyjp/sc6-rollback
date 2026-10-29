@@ -46,6 +46,7 @@
 enum { LIPS_SITE_ROLLBACK = 0, LIPS_SITE_RPB = 1, LIPS_SITE_RPB_SCRATCH = 2, LIPS_SITE_FP = 3,
        LIPS_SITE_CORE = 4, LIPS_SITE_PK = 5, LIPS_SITE_PKD = 6,   /* fix: harness-only control names (h_lips_skip_site=core|pk|pkd) */
        LIPS_SITE_EVSEG = 7, LIPS_SITE_PKDV024 = 8,                 /* v0.25: h_lips_skip_site=evseg (one shared LIPSYNCEV budget) | pkd_v024 */
+       LIPS_SITE_FLUSH = 9,                                        /* v0.36.0: h_lips_skip_site=flush (LSRVX: the pending guard is not checked before late calls) */
        LIPS_SITE_N };
 
 int  lipsync_on(void);                         /* lip-sync runs (lipsync=1 accepted by rb_cfg_check) */
@@ -56,6 +57,9 @@ void lipsync_before_restore(int site);         /* rb.c: right before a snap_rest
 void lipsync_after_restore(int site);          /* rb.c: right after it */
 void lipsync_pass_start(uint32_t k, uint32_t s);   /* rb.c pass_run: the guard (first pass after a hooked restore), the watchdog, LIPSYNCEV frames */
 int  lipsync_guard_tripped(void);              /* rb.c: 1 once after a LIPSYNCGUARD FAIL (the caller aborts the rollback) */
+/* v0.36.0 (DESIGN.md §3.4, rule C): rb.c pres_flush, before UE gets late calls: the pending guard check of the last hooked restore runs now (and is
+ * disarmed), so no guard is armed while a late call (+0x038 writes KEEP) reaches UE. LIPSYNCSTAT guard_early= counts the checks made here */
+void lipsync_guard_before_late(uint32_t s);
 /* modes.c l4_post (l4=1): begin after UE's call and before the revert (pre = the pre-call copy of core .bss at bss_lo); end after it */
 void lipsync_l4_keep_begin(int slot, int resim, const uint8_t *pre, uintptr_t bss_lo, size_t bss_len);
 void lipsync_l4_keep_end(void);

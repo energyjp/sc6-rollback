@@ -252,6 +252,7 @@ pass (`modes.c`, `run_step`).
 | `+0x138`, `+0x140` (the two queries) | answered 1 and 0 by the plugin on every pass, live included; UE never sees them |
 | `+0x058` (match flow) and `+0x0c0` (battle start, lockstep stretches, the KO slow motion) | muted in predicted passes, delivered once from the confirmed pass, then the core rolls back to that frame. Inside the KO call UE frees roughly 1,900 to 3,250 blocks |
 | `+0x120` (a per-player value channel: player, index 0-7, float) and `+0x128` (a positioned one-shot) | forwarded by the live pass; a call the confirmed pass makes that no live pass made is sent once, late, from the confirmed pass. For `+0x120` it isn't sent if UE already holds a newer value for that key, and a value set only by a misprediction is set back to the confirmed value. For `+0x128` the same effect at another position isn't re-sent, and per frame at most (confirmed calls minus delivered calls) go out, so an effect never shows twice |
+| `+0x008` (effect start) with its stop `+0x010`, `+0x028` (sound) with its stop `+0x030` (0.35), `+0x038` (voice line) with its stop `+0x040` (0.36); on when `rb_pres_slots` names them, as the shipped `sc6rb.ini` does since 0.36.1 (without the key, only `+0x120` / `+0x128`) | forwarded by the live pass; a start the confirmed pass made that UE never got is sent once, late, with a 0x48-byte payload copy and the confirmed r8 / r9, under the never-twice rules above plus a 3-frame near window. The stop slots are watched, not re-sent on their own: a late start is dropped if UE already got its stop. For sounds, a mirror of UE's newest-copy-only sound map decides which missed stops go out late, and the plugin calls UE's `+0x030` itself inside a live frame before a restart that would orphan one of its late copies. A late voice is dropped if UE already got a newer voice or a `+0x040` of that player. NOTES.md Part 4 |
 | every other slot | forwarded by the frame's live pass (predicted or not), muted in every re-simulation, never re-sent |
 
 **The guard around every forwarded call** (`modes.c`, the L4 guard): copy the core's `.bss` before the call, undo every write UE made
@@ -274,10 +275,11 @@ forwarded / calls forwarded from a misprediction):
 Smaller counts on listener `+0x008` (0 to 23 missed at ~110 ms, 10 to 18 at ~330 ms), `+0x0f8` (3 to 16 / 7 to 10) and `+0x090` (0 to 2 /
 10 to 12, with 7 orphaned at ~330 ms), and a few on `+0x098`, `+0x0b0`, `+0x0b8`.
 
-Hypothesis: `+0x028` and `+0x0c8` drive sounds, and a Reversal Edge's white startup spark lives in one of the uncovered slots (it was
-sometimes missing at ~110 ms, and once stayed on a weapon for a whole round at ~330 ms, which fits a "start" sent from a misprediction
-whose "stop" never came). Re-sending these needs each slot's payload layout checked first, and listener `+0x008` / `+0x028` / `+0x0c8` re-enter
-the core, so a late call would run against a later frame's state.
+These counts are from 0.34, before 0.35 / 0.36. Since then (verified on one PC, NOTES.md Part 4): a Reversal Edge's white startup spark is
+`+0x008` (effect ids `0x080f` / `0x0810`, stopped by `+0x010`), its startup sound is `+0x028`, and its voice line is `+0x038`. At 150 ms all
+three were missed starts, and since 0.35 / 0.36 they're re-sent when `rb_pres_slots` names them (the shipped `sc6rb.ini` does). Hypothesis: the spark that once stayed on a weapon for
+a whole round at ~330 ms was a missed `+0x010` stop; `+0x0c8` drives sounds too. Re-sending any other slot needs its payload layout checked
+first, and listener `+0x008` / `+0x028` / `+0x0c8` re-enter the core, so a late call runs inside the same guard as a live one.
 
 ## 7. Catching desyncs (verified)
 
@@ -313,8 +315,13 @@ reordering; it is not published.
 ## 9. Still open
 
 - The listener slots in section 6.
+- **Late sound stops (0.36)** have run in a real game only 6 times (one two-PC battle at about 335 ms); the rest of their proof is a model
+  of UE's sound handler and the test harness (NOTES.md 4.7). Which sound cues loop is unknown.
+- **The late spark, sound and voice** (0.35 / 0.36) passed three two-PC battles with every check in agreement; more battles, pings and
+  characters would show more.
 - **Beyond the window:** at about 330 ms (delay 4 + 7 frames of rollback) the game still waited on the other PC on about 1 frame in 10
-  (735 and 769 waits in 7,616 armed frames); more at higher ping. A larger window needs deeper rollback proven first.
+  (735 and 769 waits in 7,616 armed frames; 11 to 13% of frames in the 0.36 sessions at about 335 ms); more at higher ping. A larger window
+  needs deeper rollback proven first.
 - **Audio** stutters at high ping (hypothesis: the waits plus sound calls missed or orphaned by rollbacks).
 - **The stock-game bug's natural rate** between two PCs is unmeasured (NOTES.md 1.7).
 - **Ranked can't be told apart** from Casual or Player Match: no data-only detector was found (hypothesis that none exists).

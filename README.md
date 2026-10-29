@@ -7,7 +7,7 @@ Rollback netcode for **SOULCALIBUR VI** on Steam (PC), as a native plugin. **Exp
 - It also carries a four-byte fix for a bug in SC6 itself that can make a Reversal Edge clash come out differently on two PCs. See
   [The stock-game bug](#the-stock-game-bug) and [docs/NOTES.md](docs/NOTES.md).
 
-Version 0.34.1. Built for the current Steam build of the game (`SoulcaliburVI.exe` sha256
+Version 0.36.1. Built for the current Steam build of the game (`SoulcaliburVI.exe` sha256
 `F8904E4B04BCA3B47BC52A683F6190365D2EB89EE8F44F8072759E9C5E04A553`).
 
 ## Status
@@ -16,11 +16,15 @@ Version 0.34.1. Built for the current Steam build of the game (`SoulcaliburVI.ex
   same frame in every battle. One battle desynced, in a Reversal Edge clash, before the stock-game fix below.
 - With 0.34.0 (the same gameplay code as 0.34.1): 3 battles at about 110 and 330 ms, every cross-PC check passed, and all 14 Reversal Edge
   clashes in them came out the same on both PCs.
+- With 0.36.0 (the same code as 0.36.1 apart from the log folder default and some badge and log text): 3 battles at about 335, 335 and 156 ms, every
+  cross-PC check passed on both PCs, and the re-sent Reversal Edge spark, startup sound and voice line showed with nothing doubled or stuck.
+  0.36.1 pairs with 0.34.1 (the same protocol); the re-sending is local to each PC.
 - Known issues:
-  - Some visual effects are still missed or left behind by a rollback. For example, a Reversal Edge's white startup spark sometimes doesn't
-    show, and once stayed on a weapon for a whole round.
-  - At about 330 ms the game still waits on the other PC on roughly 1 frame in 10, and more at higher pings (the badge turns yellow,
-    "at limit").
+  - Effects, sounds and voice lines that a rollback hid are now sent a few frames late (since 0.36.1: the Reversal Edge's
+    spark, startup sound and voice line among them; [docs/NOTES.md](docs/NOTES.md) Part 4). Effects on other listener slots can still be
+    missed or left behind; with 0.34.x a Reversal Edge spark once stayed on a weapon for a whole round.
+  - At about 330 ms the game still waits on the other PC on roughly 1 frame in 8 to 10, and more at higher pings (the badge turns yellow,
+    "at limit"). That's the ping going past what the input delay plus 7 frames of rollback can cover.
   - Audio can stutter at high ping.
 - Not tested: Linux / Proton, and running together with other mods that hook the game (UE4SS-based mods such as HorseMod). Don't run it
   together with another rollback mod such as SC6 Astral.
@@ -34,7 +38,7 @@ You need [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader
 2. Open the game folder: in Steam, right-click SOULCALIBUR VI, then Manage, then Browse local files. Go to `SoulcaliburVI\Binaries\Win64`.
 3. Put the ASI Loader's x64 DLL there and name it `dsound.dll`. Skip this if another mod already put an ASI loader there.
 4. Make a `plugins` folder there, and copy `sc6rb.asi` and `sc6rb.ini` from the release zip into it.
-5. Start the game. At the main menu the bottom center should say `sc6rb 0.34.1 loaded`. **F2** hides and shows it.
+5. Start the game. At the main menu the bottom center should say `sc6rb 0.36.1 loaded`. **F2** hides and shows it.
 
 The files end up as:
 
@@ -51,7 +55,7 @@ it's doing:
 
 | Badge | Meaning |
 |---|---|
-| `sc6rb 0.34.1 loaded` (white) | Loaded, at the menus. |
+| `sc6rb 0.36.1 loaded` (white) | Loaded, at the menus. |
 | `PAIRING...` (yellow) | The two copies found each other and are agreeing on when to start. |
 | `ROLLBACK ON  delay 2  ping 110 ms  rollbacks 123` (green) | Rollback is on for this battle. |
 | `ROLLBACK ON - at limit (waiting on the other PC) ...` (yellow) | The ping is beyond what rollback can cover, so the game sometimes waits, as with the stock netcode. |
@@ -108,8 +112,8 @@ writes the exe on disk.
   delay. Every 60 frames the two PCs compare a hash chained over the gameplay state of the fight frames in between (round starts, KOs
   and replays are not in it); a mismatch shows DESYNC.
 - **Presentation.** Calls from the battle core into Unreal (effects, sounds, lip-sync, the KO slow motion) are handled per type: some are
-  muted in predicted frames and delivered from the confirmed frame, some are delivered late, and Unreal's writes back into battle state are
-  undone.
+  muted in predicted frames and delivered from the confirmed frame, some are delivered late (effects, sounds and voice lines a rollback
+  hid, never twice; for sounds, missed stops too), and Unreal's writes back into battle state are undone.
 
 [docs/DESIGN.md](docs/DESIGN.md) explains all of this in detail, including how SC6's own online netcode works, and
 [docs/NOTES.md](docs/NOTES.md) has the individual game findings.

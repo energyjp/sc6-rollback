@@ -31,6 +31,7 @@ static void wsx_add_pins(SPin *pins, int *npins, int max);
 static void an_add_pins(SPin *pins, int *npins, int max);
 static volatile int g_repin_request;
 static void fp_lsn_pre(void);
+static void fp_lsn_post(int slot);   /* v0.36.0: modes_lsn_inject brackets its call with the FP guard */
 static int g_fp_slot;
 static int g_wsl_depth;
 static int g_bigscrub;
@@ -1777,25 +1778,46 @@ static void l4_post(int slot, uint64_t *res) {
  * listener in place). Each call is made as the proxy makes a forwarded live call: UE's real function with (listener, &payload), inside L4's guard
  * (the core .bss copy before, the revert after with L4W lines, the kept listener pointer, the frees made during the call checked by L4DANGLE, a core
  * entry inside it counted and logged by L4REENTRY), so UE's presentation work can never change the simulation. guard = 0 only under the
- * harness control h_rb_pres_nol4 (XFXW). The listener calls of a normal pass are untouched. */
-int modes_lsn_deliver(int n, const uint8_t *slots, uint8_t (*pay)[0x30], int guard) {
+ * harness control h_rb_pres_nol4 (XFXW). The listener calls of a normal pass are untouched.
+ * v0.35.0 (OPTA-M2-SPEC.md §25): + r8 / r9. UE's function gets (listener, &q[i].pay, the confirmed call's r8, r9): the registers UE would have seen (none of
+ * +0x008 / +0x010 / +0x028 / +0x120 / +0x128 reads them, V; passed anyway); rdx = the plugin's queue copy (0x48 bytes, UE reads at most 0x41: l4_rdx_window
+ * gives 0 for a plugin .bss address), crsp 0 = no stack window. L4 is unchanged. */
+int modes_lsn_deliver(int n, const RbLate *q, int guard) {
     void **lst = (void **)VA(A_LISTENER_PTR);
     void *real = *lst;
     if (!real || real == (void *)&g_proxy || g_ctx_flags || g_l4_depth) return 0;
     void **rvt = *(void ***)real;
     int done = 0;
     for (int i = 0; i < n; i++) {
-        int slot = slots[i];
+        int slot = q[i].slot;
         if (slot <= 0 || slot >= LISTENER_NSLOTS) continue;
         void *fn = rvt[slot];
         if (!fn) continue;
         uint64_t res[2] = { 0, 0 };
-        if (guard) { g_l4_late = 1; g_l4_tid = GetCurrentThreadId(); g_l4_depth = 0; g_l4_in_call = 0; g_l4_pass_resim = 0; l4_pre(slot, (uint64_t)(uintptr_t)pay[i], 0); }
-        ((int64_t (*)(void *, void *))fn)(real, pay[i]);
+        if (guard) { g_l4_late = 1; g_l4_tid = GetCurrentThreadId(); g_l4_depth = 0; g_l4_in_call = 0; g_l4_pass_resim = 0; l4_pre(slot, (uint64_t)(uintptr_t)q[i].pay, 0); }
+        ((int64_t (*)(void *, const void *, uint64_t, uint64_t))fn)(real, q[i].pay, q[i].r8, q[i].r9);
         if (guard) { l4_post(slot, res); g_l4_late = 0; g_l4_depth = 0; g_l4_in_call = 0; }
         done++;
     }
     return done;
+}
+/* v0.36.0 (OPTA-M2-SPEC.md §26, DESIGN.md §2.3): a +0x030 stop the plugin makes inside a forwarding pass, right before the core's +0x028 is forwarded (rb.c
+ * snd_fwd, from rb_lsn_pre in lsn_pre). Made exactly like a forwarded call: UE's function of this pass's listener (lp_family.self / fn), the step's tid
+ * already cleared by the thunk, the FP guard around it, L4's guard around it (g_l4_depth == 0 here: we are in the +0x028's pre hook, before its
+ * l4_pre). rdx = a plugin .bss copy (l4_rdx_window gives 0 for it), crsp 0, r8 = r9 = 0 (UE's +0x030 reads [0,8) only). Not a core call: not counted in
+ * the pass's calls / fwd, the RBLEDGER or lp_family.counts (RBPRES2 inject= and L4STAT calls_live count it). Returns 0 (nothing called) outside a step,
+ * nested in a call, or when the pass does not forward the slot. */
+int modes_lsn_inject(int slot, const uint8_t *pay8) {
+    if (slot <= 0 || slot >= LISTENER_NSLOTS || !g_ctx_flags || g_l4_depth) return 0;
+    void *fn = lp_family.fn[slot], *self = lp_family.self[slot];
+    if (!fn || !self || !g_lp_fwd[slot]) return 0;
+    static uint8_t buf[RB_LATE_PAY];
+    memset(buf, 0, sizeof buf); memcpy(buf, pay8, 8);
+    uint64_t res[2] = { 0, 0 };
+    fp_lsn_pre(); l4_pre(slot, (uint64_t)(uintptr_t)buf, 0);
+    ((int64_t (*)(void *, const void *, uint64_t, uint64_t))fn)(self, buf, 0, 0);
+    l4_post(slot, res); fp_lsn_post(slot);
+    return 1;
 }
 void l4_note_ifc(int off, const char *what) {
     if (!g_l4_in_call) return;
@@ -1878,7 +1900,7 @@ static int lsn_pre(int slot, uint64_t rdx, uint64_t *res, uint64_t crsp) {
     /* C1B3: (C1B-R3-SPEC.md §2.3.1) the +0x0c0 counter is bumped only by a call that really reaches UE: rb_lsn_pre decides first (a muted
      * state-class call never reaches UE and is never counted). h_old_c0count=1 (harness only) keeps the v0.24 order (the negative control). */
     if (slot == LSN_SLOT_BATTLE_START && g_ctx_flags && !g_run_muted && g_lp_fwd[slot] && rb_t_old_c0count()) { g_bar_lsn_seq = g_cur_seq; g_bar_lsn_calls++; }
-    if (g_ctx_flags && rb_lsn_pre(slot, rdx)) { res[0] = 0; res[1] = 0; return 1; }   /* v0.23.0-C1b: a muted state-class call (never reaches UE); v0.33.0: + rdx */
+    if (g_ctx_flags && rb_lsn_pre(slot, rdx, crsp)) { res[0] = 0; res[1] = 0; return 1; }   /* v0.23.0-C1b: a muted state-class call (never reaches UE); v0.33.0: + rdx; v0.34.2: + crsp */
     if (slot == LSN_SLOT_BATTLE_START && g_ctx_flags && !g_run_muted && g_lp_fwd[slot] && !rb_t_old_c0count()) { g_bar_lsn_seq = g_cur_seq; g_bar_lsn_calls++; }
     int skip = lsn_pre_v19(slot, rdx, res, crsp);
     if (!skip) l4_pre(slot, rdx, crsp);
